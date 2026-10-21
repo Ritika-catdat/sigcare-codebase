@@ -51,3 +51,8 @@ cleanup_comparison/
 *.bak
 .DS_Store
 Thumbs.db
+  
+# Generated package metadata
+*.egg-info/
+build/
+dist/
