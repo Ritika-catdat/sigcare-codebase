@@ -1,0 +1,53 @@
+
+# ==============================
+# Python virtual environments
+# ==============================
+.venv/
+venv/
+env/
+
+# ==============================
+# Python cache and test artifacts
+# ==============================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================
+# Generated API outputs
+# ==============================
+api_outputs/
+output/
+outputs/
+cleanup_comparison/
+
+# ==============================
+# Confidential input documents
+# ==============================
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+
+# ==============================
+# Secrets and local environment files
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
