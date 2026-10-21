@@ -14,6 +14,17 @@ Local first-stage tool for Sigcare.
 This is a baseline screening tool, not a trained authenticity AI model. Genuine/suspicious classification requires client-approved definitions, labelled examples and validation. It never labels a document "genuine" or "fake".
 It does **not remove watermarks or erase marks from prescriptions**. It creates a separate OCR copy and preserves all marks so the original remains auditable. Watermark removal could alter evidence.
 
+## Run the API with Docker
+```bash
+cp .env.example .env
+docker compose build
+docker compose up -d
+curl http://localhost:8000/health
+```
+Upload a PDF: `curl -F "file=@data/input_pdf.pdf" http://localhost:8000/api/v1/quality-check`.
+Staging (EC2) steps are in `DEPLOYMENT.md`. The `documents/` folder holds client
+infrastructure and login details and is git-ignored; never commit it.
+
 ## Windows setup
 Use Python 3.11 or newer:
 ```bat

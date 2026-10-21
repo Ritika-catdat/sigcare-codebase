@@ -1,0 +1,40 @@
+# Sigcare Document Quality API - local and staging (single EC2) deployment.
+#
+#   cp .env.example .env      # then edit values
+#   docker compose build
+#   docker compose up -d
+#   curl http://localhost:8000/health
+#
+# APP_ENV, AWS_REGION etc. are read from .env. Values that are empty in .env
+# are passed through as empty; the API currently only uses the SIGCARE_* ones.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sigcare-quality-api:${IMAGE_TAG:-latest}
+    container_name: sigcare-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Host port is configurable so staging can sit behind nginx/ALB later.
+      - "${SIGCARE_HOST_PORT:-8000}:8000"
+    volumes:
+      # Persist job outputs (reports + cleaned page images) across restarts.
+      - sigcare_outputs:/app/api_outputs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  sigcare_outputs:

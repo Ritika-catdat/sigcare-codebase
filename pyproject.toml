@@ -7,7 +7,20 @@ name = "sigcare-document-quality"
 version = "0.1.0"
 description = "Local document integrity screening and image cleanup for Sigcare"
 requires-python = ">=3.11"
-dependencies = ["PyMuPDF>=1.24.0", "Pillow>=10.0.0", "opencv-python-headless>=4.9.0", "numpy>=1.26.0", "typer>=0.12.0", "rich>=13.7.0"]
+dependencies = [
+    "PyMuPDF>=1.24.0",
+    "Pillow>=10.0.0",
+    "opencv-python-headless>=4.9.0",
+    "numpy>=1.26.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    # API layer (sigcare_quality.api)
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "python-multipart>=0.0.9",
+    # Page-counter OCR fallback used by the splitter; needs the tesseract binary
+    "pytesseract>=0.3.10",
+]
 
 [project.scripts]
 sigcare-quality = "sigcare_quality.cli:app"
