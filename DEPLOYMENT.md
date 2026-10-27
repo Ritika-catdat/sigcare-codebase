@@ -32,38 +32,46 @@ pages are split into prescriptions, each prescription gets a quality check and
 cleaned images, then AWS Textract (async, via the staging bucket) produces
 `processed/<prescription>/structured_extraction.json`.
 
-### S3 watcher (service `watcher`)
+### S3 worker (service `worker`)
 
-`docker compose up -d` also starts `sigcare-watcher`. It runs
-`python -m sigcare_quality.s3_watcher` and checks the day's input folder every
-`SIGCARE_WATCH_INTERVAL_SECONDS` (default 60). The bucket is set per environment
-with `SIGCARE_S3_BUCKET` (test and prod differ). "Today" uses `SIGCARE_S3_TIMEZONE`
-(default Europe/London); yesterday is also checked (`SIGCARE_WATCH_LOOKBACK_DAYS=1`).
+`docker compose up -d` also starts `sigcare-worker`. It runs
+`python -m sigcare_quality.s3_watcher`, processes files itself (it does not call
+the API), and checks the day's input folder every `SIGCARE_WATCH_INTERVAL_SECONDS`
+(default 60). The bucket is set per environment with `SIGCARE_S3_BUCKET` (test
+and prod differ). "Today" uses `SIGCARE_S3_TIMEZONE` (default Europe/London);
+yesterday is also checked (`SIGCARE_WATCH_LOOKBACK_DAYS=1`). The older names
+`S3_BUCKET_NAME`, `S3_POLL_INTERVAL_SECONDS` and `S3_WORKER_DRY_RUN` still work.
 
 ```
-<bucket>/<yyyy>/<MMM>/<dd>/input/<file>.pdf                  drop new files here
-<bucket>/<yyyy>/<MMM>/<dd>/intermediary/<file>/original/<file>.pdf   unchanged copy, saved before cleaning
-<bucket>/<yyyy>/<MMM>/<dd>/intermediary/<file>/...           front-sheet report, split PDFs,
-                                                             cleaned pages, quality reports,
-                                                             structured_extraction.json, result.json
-<bucket>/<yyyy>/<MMM>/<dd>/intermediary/<file>/status.json   RUNNING / COMPLETED / FAILED
-<bucket>/<yyyy>/<MMM>/<dd>/processed/<file>.pdf              input moved here when done
-<bucket>/<yyyy>/<MMM>/<dd>/processed/<file>.json             final structured result
+<yyyy>/<MMM>/<dd>/input/<file>.pdf                         drop new files here
+<yyyy>/<MMM>/<dd>/intermediary/<file>/original/<file>.pdf  unchanged copy, saved before cleaning
+<yyyy>/<MMM>/<dd>/intermediary/<file>/split_prescriptions/ split PDFs + split_report.txt
+<yyyy>/<MMM>/<dd>/intermediary/<file>/cleanup/<rx>/        cleaned page images
+<yyyy>/<MMM>/<dd>/intermediary/<file>/forensics/<rx>/      quality reports
+<yyyy>/<MMM>/<dd>/intermediary/<file>/extraction/<rx>/     structured_extraction.json (Textract)
+<yyyy>/<MMM>/<dd>/intermediary/<file>/reports/             front-sheet report, frontsheets_removed.pdf
+<yyyy>/<MMM>/<dd>/intermediary/<file>/manifest/            status.json, result.json, job_summary.json
+<yyyy>/<MMM>/<dd>/processed/<file>.pdf                     input moved here when done
+<yyyy>/<MMM>/<dd>/processed/<file>.json                    final structured result
 ```
 
 Folder format is `yyyy/MMM/dd`, e.g. `2026/Oct/27/input/Document_261012.pdf`
 (three-letter month, first letter capital; `SIGCARE_S3_MONTH_CASE=title`). Set
 `SIGCARE_S3_ROOT_PREFIX` if the date folders sit under a top-level folder.
 
-The input is moved to `processed/` only after every output is stored. If a file
-fails, it stays in `input/` and `intermediary/<file>/status.json` says `FAILED`
-with the error. The watcher then skips that file. Delete that `status.json` to
-retry it. Files that are not PDFs are logged and left alone.
+Rules:
+- The input moves to `processed/` only after every output is stored.
+- If `processed/<file>` already exists, the input is a duplicate and is deleted.
+- If `manifest/job_summary.json` exists but the input is still in `input/`, the
+  file is skipped for manual recovery.
+- A failed file stays in `input/` with `manifest/status.json` = `FAILED` and the
+  error, and is skipped. Delete that `status.json` to retry it.
+- `SIGCARE_WATCH_DRY_RUN=true` only logs eligible files.
 
 Useful commands:
 ```bash
-docker compose logs -f watcher
-docker compose run --rm watcher python -m sigcare_quality.s3_watcher --once   # single scan
+docker compose logs -f worker
+docker compose run --rm worker python -m sigcare_quality.s3_watcher --once   # single scan
 ```
 
 ## 2. Run locally
@@ -166,7 +174,7 @@ bucket in `SIGCARE_TEXTRACT_STAGING_BUCKET` (same region as `AWS_REGION`):
 - `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `arn:aws:s3:::<bucket>/sigcare-temporary/*`
 - `s3:ListBucket` on `arn:aws:s3:::<bucket>` (used by the `/ready` check)
 
-For the S3 watcher, the role also needs, on `SIGCARE_S3_BUCKET`:
+For the S3 worker, the role also needs, on `SIGCARE_S3_BUCKET`:
 `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`
 on `arn:aws:s3:::<bucket>/*` (it reads `input/`, writes `intermediary/` and
 `processed/`, and deletes the input after moving it). If

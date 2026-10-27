@@ -3,18 +3,26 @@
 Bucket layout (agreed folder structure; the bucket differs between test and prod):
 
     <bucket>/[<root prefix>/]<yyyy>/<MMM>/<dd>/input/<file>.pdf
-        new files are dropped here
+        new files are dropped here, e.g. 2026/Oct/27/input/Doc.pdf
     .../<dd>/intermediary/<file stem>/
-        original/<file>.pdf      unchanged copy saved before any cleaning
-        status.json              RUNNING / COMPLETED / FAILED (+ error)
-        frontsheet_reports/, frontsheets_removed.pdf, split_prescriptions/,
-        processed/<prescription>/{cleaned_pages/, quality_report.*, structured_extraction.json},
-        result.json
-    .../<dd>/processed/<file>.pdf    the input file, moved here once processed
-    .../<dd>/processed/<file stem>.json  final structured result
+        original/<file>.pdf                unchanged copy saved before any cleaning
+        split_prescriptions/               split PDFs + split_report.txt
+        cleanup/<prescription>/            cleaned page images used for OCR
+        forensics/<prescription>/          quality_report.json / .txt
+        extraction/<prescription>/         structured_extraction.json (Textract)
+        reports/                           frontsheet_report.json, frontsheets_removed.pdf
+        manifest/status.json               RUNNING / COMPLETED / FAILED (+ error)
+        manifest/result.json               full result (paths point at the S3 keys above)
+        manifest/job_summary.json          written last, when the run succeeded
+    .../<dd>/processed/<file>.pdf          the input file, moved here once processed
+    .../<dd>/processed/<file stem>.json    final structured result
 
-A file that fails stays in input/ with status FAILED in its intermediary folder and
-is skipped from then on. Delete intermediary/<file stem>/status.json to retry it.
+Rules (same as the earlier VM worker):
+- input whose processed/<file> already exists is a duplicate and is deleted;
+- input with manifest/job_summary.json but still in input/ needs manual recovery
+  and is skipped;
+- a failed file stays in input/ with manifest/status.json FAILED and is skipped
+  from then on. Delete that status.json to retry it.
 
 Run:
     python -m sigcare_quality.s3_watcher            # poll forever
@@ -47,6 +55,15 @@ LOG = logging.getLogger(__name__)
 MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 
 
+def _env(*names: str, default: str = "") -> str:
+    """First non-empty value among names; old VM worker names are accepted too."""
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
+
 @dataclass(frozen=True)
 class WatcherConfig:
     bucket: str
@@ -57,26 +74,28 @@ class WatcherConfig:
     lookback_days: int = 1
     work_dir: Path = Path("api_outputs/s3_jobs")
     keep_local: bool = False
+    dry_run: bool = False
     dpi: int = 220
     region: str = "eu-west-2"
 
     @classmethod
     def from_env(cls) -> "WatcherConfig":
-        bucket = os.getenv("SIGCARE_S3_BUCKET", "").strip() or os.getenv("S3_BUCKET_NAME", "").strip()
+        bucket = _env("SIGCARE_S3_BUCKET", "S3_BUCKET_NAME")
         if not bucket:
             raise RuntimeError("SIGCARE_S3_BUCKET is not configured (test and prod use different buckets).")
         output_dir = Path(os.getenv("SIGCARE_API_OUTPUT_DIR", "api_outputs"))
         return cls(
             bucket=bucket,
-            root_prefix=os.getenv("SIGCARE_S3_ROOT_PREFIX", "").strip("/"),
-            month_case=os.getenv("SIGCARE_S3_MONTH_CASE", "title").lower(),
-            timezone=os.getenv("SIGCARE_S3_TIMEZONE", "Europe/London"),
-            interval_seconds=int(os.getenv("SIGCARE_WATCH_INTERVAL_SECONDS", "60")),
-            lookback_days=int(os.getenv("SIGCARE_WATCH_LOOKBACK_DAYS", "1")),
-            work_dir=Path(os.getenv("SIGCARE_WATCH_WORK_DIR", str(output_dir / "s3_jobs"))),
-            keep_local=os.getenv("SIGCARE_WATCH_KEEP_LOCAL", "false").lower() == "true",
-            dpi=int(os.getenv("SIGCARE_WATCH_DPI", "220")),
-            region=os.getenv("AWS_REGION", "eu-west-2"),
+            root_prefix=_env("SIGCARE_S3_ROOT_PREFIX").strip("/"),
+            month_case=_env("SIGCARE_S3_MONTH_CASE", default="title").lower(),
+            timezone=_env("SIGCARE_S3_TIMEZONE", default="Europe/London"),
+            interval_seconds=int(_env("SIGCARE_WATCH_INTERVAL_SECONDS", "S3_POLL_INTERVAL_SECONDS", default="60")),
+            lookback_days=int(_env("SIGCARE_WATCH_LOOKBACK_DAYS", default="1")),
+            work_dir=Path(_env("SIGCARE_WATCH_WORK_DIR", default=str(output_dir / "s3_jobs"))),
+            keep_local=_env("SIGCARE_WATCH_KEEP_LOCAL", default="false").lower() == "true",
+            dry_run=_env("SIGCARE_WATCH_DRY_RUN", "S3_WORKER_DRY_RUN", default="false").lower() == "true",
+            dpi=int(_env("SIGCARE_WATCH_DPI", default="220")),
+            region=_env("AWS_REGION", default="eu-west-2"),
         )
 
 
@@ -90,6 +109,28 @@ def date_prefix(day: date, config: WatcherConfig) -> str:
     parts = [config.root_prefix] if config.root_prefix else []
     parts.append(f"{day.year:04d}/{month}/{day.day:02d}")
     return "/".join(parts)
+
+
+def intermediary_path(relative: str) -> str | None:
+    """Map a path inside the local job folder to its place under intermediary/<file>/.
+
+    Returns None for files that are not uploaded (local status, the input copy).
+    """
+    parts = PurePosixPath(relative).parts
+    if not parts or parts[0] == "input" or parts == ("status.json",):
+        return None
+    if parts == ("result.json",):
+        return "manifest/result.json"
+    if parts[0] == "split_prescriptions":
+        return "/".join(parts)
+    if parts[0] == "processed" and len(parts) >= 3:
+        prescription, remainder = parts[1], parts[2:]
+        if remainder[0] == "cleaned_pages":
+            return "/".join(("cleanup", prescription) + remainder[1:])
+        if remainder == ("structured_extraction.json",):
+            return f"extraction/{prescription}/structured_extraction.json"
+        return "/".join(("forensics", prescription) + remainder)
+    return f"reports/{parts[-1]}"
 
 
 @dataclass
@@ -120,6 +161,16 @@ class S3Watcher:
                 return keys
             kwargs["ContinuationToken"] = page["NextContinuationToken"]
 
+    def _exists(self, key: str) -> bool:
+        try:
+            self.s3.head_object(Bucket=self.config.bucket, Key=key)
+            return True
+        except ClientError as exc:
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status == 404 or exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                return False
+            raise
+
     def _read_json(self, key: str) -> dict[str, Any] | None:
         try:
             body = self.s3.get_object(Bucket=self.config.bucket, Key=key)["Body"].read()
@@ -147,18 +198,20 @@ class S3Watcher:
             MetadataDirective="COPY",
         )
 
-    def _upload_tree(self, local_dir: Path, prefix: str, skip: set[Path]) -> int:
+    def _upload_job(self, job_dir: Path, intermediary: str) -> int:
         count = 0
-        for path in sorted(local_dir.rglob("*")):
-            if not path.is_file() or path in skip or path.suffix == ".tmp":
+        for path in sorted(job_dir.rglob("*")):
+            if not path.is_file() or path.suffix == ".tmp":
+                continue
+            target = intermediary_path(path.relative_to(job_dir).as_posix())
+            if target is None:
                 continue
             content_type = {
                 ".json": "application/json", ".pdf": "application/pdf",
                 ".png": "image/png", ".txt": "text/plain",
             }.get(path.suffix.lower(), "application/octet-stream")
             self.s3.upload_file(
-                str(path), self.config.bucket,
-                f"{prefix}{path.relative_to(local_dir).as_posix()}",
+                str(path), self.config.bucket, f"{intermediary}{target}",
                 ExtraArgs={"ContentType": content_type, "ServerSideEncryption": "AES256"},
             )
             count += 1
@@ -186,6 +239,11 @@ class S3Watcher:
             pending.append(key)
         return sorted(pending)
 
+    def _skip_once(self, key: str, message: str, *args: Any) -> None:
+        if key not in self._warned:
+            LOG.warning(message, *args)
+            self._warned.add(key)
+
     def process_key(self, input_key: str) -> str:
         """Process one input object; returns its final status."""
         bucket = self.config.bucket
@@ -193,17 +251,24 @@ class S3Watcher:
         stem = PurePosixPath(name).stem
         day_prefix = input_key.rsplit("/input/", 1)[0]
         intermediary = f"{day_prefix}/intermediary/{stem}/"
-        status_key = f"{intermediary}status.json"
+        status_key = f"{intermediary}manifest/status.json"
+        summary_key = f"{intermediary}manifest/job_summary.json"
         original_key = f"{intermediary}original/{name}"
         processed_key = f"{day_prefix}/processed/{name}"
         result_key = f"{day_prefix}/processed/{stem}.json"
 
+        if self._exists(processed_key):
+            LOG.info("Already archived; removing duplicate input %s", input_key)
+            self.s3.delete_object(Bucket=bucket, Key=input_key)
+            return "DUPLICATE"
         previous = self._read_json(status_key)
         if previous and previous.get("status") == "FAILED":
-            if input_key not in self._warned:
-                LOG.warning("Skipping %s: previous run FAILED (%s). Delete %s to retry.",
+            self._skip_once(input_key, "Skipping %s: previous run FAILED (%s). Delete %s to retry.",
                             input_key, previous.get("error"), status_key)
-                self._warned.add(input_key)
+            return "SKIPPED"
+        if self._exists(summary_key):
+            self._skip_once(input_key, "Manifest exists but source is still in input; "
+                            "manual recovery is needed: %s", input_key)
             return "SKIPPED"
 
         job_id = hashlib.sha256(f"{bucket}/{input_key}/{now_iso()}".encode()).hexdigest()[:32]
@@ -242,14 +307,26 @@ class S3Watcher:
                 split_stem=stem,
                 path_base=job_dir,
             )
-            # Artifact paths in result are relative to the intermediary folder.
+            self._point_result_at_s3(result, intermediary)
             result["s3"] = s3_info
             result["original_sha256"] = run_status["original_sha256"]
             (job_dir / "result.json").write_text(
                 json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 
-            uploaded = self._upload_tree(job_dir, intermediary, skip={local_pdf, job_dir / "status.json"})
+            uploaded = self._upload_job(job_dir, intermediary)
             self._put_json(result_key, result)
+            self._put_json(summary_key, {
+                "source_key": input_key,
+                "job_id": job_id,
+                "status": result["status"],
+                "source_page_count": result["source_page_count"],
+                "prescriptions_created": result["prescriptions_created"],
+                "removed_frontsheet_pages": result["frontsheet_detection"]["removed_pages"],
+                "artifacts_uploaded": uploaded,
+                "original_sha256": run_status["original_sha256"],
+                "processed_at_utc": now_iso(),
+                "note": result.get("note"),
+            })
             # Move the input to processed/ only after every output is stored.
             self._copy(input_key, processed_key)
             self.s3.delete_object(Bucket=bucket, Key=input_key)
@@ -263,12 +340,12 @@ class S3Watcher:
             return result["status"]
 
         except Exception as exc:
-            LOG.exception("Processing failed for %s", input_key)
+            LOG.exception("Processing failed for %s; source retained for investigation", input_key)
             run_status.update(status="FAILED", finished_at=now_iso(),
                               error=f"{type(exc).__name__}: {exc}")
             try:
                 # Keep whatever was produced for diagnosis.
-                self._upload_tree(job_dir, intermediary, skip={local_pdf, job_dir / "status.json"})
+                self._upload_job(job_dir, intermediary)
                 self._put_json(status_key, run_status)
             except Exception:
                 LOG.exception("Could not record failure for %s", input_key)
@@ -277,24 +354,48 @@ class S3Watcher:
             if not self.config.keep_local:
                 shutil.rmtree(job_dir, ignore_errors=True)
 
+    @staticmethod
+    def _point_result_at_s3(result: dict[str, Any], intermediary: str) -> None:
+        """Rewrite local artifact paths in the result to their S3 keys."""
+        def key(relative: str | None) -> str | None:
+            if not relative:
+                return relative
+            parts = PurePosixPath(relative).parts
+            if parts[0] == "processed" and parts[-1] == "cleaned_pages":
+                return f"{intermediary}cleanup/{parts[1]}"
+            target = intermediary_path(relative)
+            return f"{intermediary}{target}" if target else relative
+
+        for name in ("split_report", "frontsheet_report"):
+            result[name] = key(result.get(name))
+        for item in result.get("results", []):
+            for name in ("quality_report_json", "quality_report_txt",
+                         "cleaned_pages_directory", "structured_extraction_json"):
+                item[name] = key(item.get(name))
+
     def scan_once(self) -> dict[str, str]:
         outcomes: dict[str, str] = {}
         for day in self.days_to_scan():
             for key in self.pending_inputs(day):
                 if self._stop.is_set():
                     return outcomes
+                if self.config.dry_run:
+                    LOG.info("[DRY RUN] Eligible input PDF: s3://%s/%s", self.config.bucket, key)
+                    outcomes[key] = "DRY_RUN"
+                    continue
                 outcomes[key] = self.process_key(key)
         return outcomes
 
     def run_forever(self) -> None:
-        LOG.info("Watching s3://%s/%s/input/ every %ss",
+        LOG.info("S3 watcher started; bucket=%s, today=%s, interval=%ss, dry_run=%s",
                  self.config.bucket, date_prefix(self.days_to_scan()[-1], self.config),
-                 self.config.interval_seconds)
+                 self.config.interval_seconds, self.config.dry_run)
         while not self._stop.is_set():
             try:
                 self.scan_once()
             except Exception:
-                LOG.exception("Scan failed; retrying in %ss", self.config.interval_seconds)
+                LOG.exception("Could not scan S3 input folders; retrying in %ss",
+                              self.config.interval_seconds)
             self._stop.wait(self.config.interval_seconds)
         LOG.info("Watcher stopped.")
 
@@ -308,7 +409,7 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="scan once and exit")
     args = parser.parse_args()
     logging.basicConfig(
-        level=os.getenv("SIGCARE_LOG_LEVEL", "INFO").upper(),
+        level=_env("SIGCARE_LOG_LEVEL", "LOG_LEVEL", default="INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     watcher = S3Watcher(WatcherConfig.from_env())

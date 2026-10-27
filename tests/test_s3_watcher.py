@@ -7,7 +7,10 @@ import pytest
 from botocore.exceptions import ClientError
 
 from sigcare_quality import processing
-from sigcare_quality.s3_watcher import S3Watcher, WatcherConfig, date_prefix
+from sigcare_quality.s3_watcher import S3Watcher, WatcherConfig, date_prefix, intermediary_path
+
+DAY = "2026/Oct/27"
+INTER = f"{DAY}/intermediary/Doc 1"
 
 
 class FakeS3:
@@ -19,6 +22,12 @@ class FakeS3:
     def list_objects_v2(self, Bucket, Prefix, **_):
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
         return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+                              "HeadObject")
+        return {}
 
     def get_object(self, Bucket, Key):
         if Key not in self.objects:
@@ -72,42 +81,92 @@ def test_date_prefix():
                                                         month_case="lower")) == "sigcare/2026/jan/03"
 
 
+def test_intermediary_layout_matches_vm_worker():
+    assert intermediary_path("result.json") == "manifest/result.json"
+    assert intermediary_path("split_prescriptions/a_prescription_001.pdf") == "split_prescriptions/a_prescription_001.pdf"
+    assert intermediary_path("processed/rx1/cleaned_pages/page_001.png") == "cleanup/rx1/page_001.png"
+    assert intermediary_path("processed/rx1/quality_report.json") == "forensics/rx1/quality_report.json"
+    assert intermediary_path("processed/rx1/structured_extraction.json") == "extraction/rx1/structured_extraction.json"
+    assert intermediary_path("frontsheet_reports/frontsheet_report.json") == "reports/frontsheet_report.json"
+    assert intermediary_path("input/Doc.pdf") is None
+    assert intermediary_path("status.json") is None
+
+
 def test_process_key_moves_input_and_writes_outputs(watcher):
     s3 = watcher.s3
     original = _pdf_bytes()
-    s3.objects["2026/Oct/27/input/Doc 1.pdf"] = original
-    s3.objects["2026/Oct/27/input/"] = b""            # folder placeholder
-    s3.objects["2026/Oct/27/input/notes.txt"] = b"x"   # ignored
+    s3.objects[f"{DAY}/input/Doc 1.pdf"] = original
+    s3.objects[f"{DAY}/input/"] = b""            # folder placeholder
+    s3.objects[f"{DAY}/input/notes.txt"] = b"x"   # ignored
 
-    assert watcher.pending_inputs(date(2026, 10, 27)) == ["2026/Oct/27/input/Doc 1.pdf"]
+    assert watcher.pending_inputs(date(2026, 10, 27)) == [f"{DAY}/input/Doc 1.pdf"]
     # Synthetic, mostly blank pages trip the quality check, so REVIEW is expected.
-    assert watcher.process_key("2026/Oct/27/input/Doc 1.pdf").startswith("COMPLETED")
+    assert watcher.process_key(f"{DAY}/input/Doc 1.pdf").startswith("COMPLETED")
 
     keys = set(s3.objects)
-    assert "2026/Oct/27/input/Doc 1.pdf" not in keys
-    assert s3.objects["2026/Oct/27/processed/Doc 1.pdf"] == original
+    assert f"{DAY}/input/Doc 1.pdf" not in keys
+    assert s3.objects[f"{DAY}/processed/Doc 1.pdf"] == original
     # Untouched original kept before cleaning, for later verification.
-    assert s3.objects["2026/Oct/27/intermediary/Doc 1/original/Doc 1.pdf"] == original
-    assert "2026/Oct/27/intermediary/Doc 1/split_prescriptions/Doc 1_prescription_001.pdf" in keys
-    assert "2026/Oct/27/intermediary/Doc 1/processed/Doc 1_prescription_001/structured_extraction.json" in keys
-    assert any(k.startswith("2026/Oct/27/intermediary/Doc 1/processed/Doc 1_prescription_001/cleaned_pages/") for k in keys)
+    assert s3.objects[f"{INTER}/original/Doc 1.pdf"] == original
+    assert f"{INTER}/split_prescriptions/Doc 1_prescription_001.pdf" in keys
+    assert f"{INTER}/cleanup/Doc 1_prescription_001/page_001.png" in keys
+    assert f"{INTER}/forensics/Doc 1_prescription_001/quality_report.json" in keys
+    assert f"{INTER}/extraction/Doc 1_prescription_001/structured_extraction.json" in keys
+    assert f"{INTER}/reports/frontsheet_report.json" in keys
+    assert f"{INTER}/manifest/result.json" in keys
 
-    result = json.loads(s3.objects["2026/Oct/27/processed/Doc 1.json"])
+    result = json.loads(s3.objects[f"{DAY}/processed/Doc 1.json"])
     assert result["status"].startswith("COMPLETED")
-    assert result["s3"]["original_copy_key"] == "2026/Oct/27/intermediary/Doc 1/original/Doc 1.pdf"
+    assert result["s3"]["original_copy_key"] == f"{INTER}/original/Doc 1.pdf"
     assert result["results"][0]["source_pages"] == [1, 2]
-    status = json.loads(s3.objects["2026/Oct/27/intermediary/Doc 1/status.json"])
-    assert status["status"].startswith("COMPLETED") and status["original_sha256"]
+    assert result["results"][0]["cleaned_pages_directory"] == f"{INTER}/cleanup/Doc 1_prescription_001"
+    assert result["results"][0]["structured_extraction_json"] == (
+        f"{INTER}/extraction/Doc 1_prescription_001/structured_extraction.json")
+    summary = json.loads(s3.objects[f"{INTER}/manifest/job_summary.json"])
+    assert summary["source_key"] == f"{DAY}/input/Doc 1.pdf" and summary["original_sha256"]
+    status = json.loads(s3.objects[f"{INTER}/manifest/status.json"])
+    assert status["status"].startswith("COMPLETED")
 
 
 def test_failed_file_stays_in_input_and_is_skipped(watcher):
     s3 = watcher.s3
-    s3.objects["2026/Oct/27/input/bad.pdf"] = b"%PDF-1.7 not really a pdf"
+    s3.objects[f"{DAY}/input/bad.pdf"] = b"%PDF-1.7 not really a pdf"
 
-    assert watcher.process_key("2026/Oct/27/input/bad.pdf") == "FAILED"
-    assert "2026/Oct/27/input/bad.pdf" in s3.objects
-    status = json.loads(s3.objects["2026/Oct/27/intermediary/bad/status.json"])
+    assert watcher.process_key(f"{DAY}/input/bad.pdf") == "FAILED"
+    assert f"{DAY}/input/bad.pdf" in s3.objects
+    status = json.loads(s3.objects[f"{DAY}/intermediary/bad/manifest/status.json"])
     assert status["status"] == "FAILED" and status["error"]
-    assert s3.objects["2026/Oct/27/intermediary/bad/original/bad.pdf"] == b"%PDF-1.7 not really a pdf"
+    assert s3.objects[f"{DAY}/intermediary/bad/original/bad.pdf"] == b"%PDF-1.7 not really a pdf"
 
-    assert watcher.process_key("2026/Oct/27/input/bad.pdf") == "SKIPPED"
+    assert watcher.process_key(f"{DAY}/input/bad.pdf") == "SKIPPED"
+
+
+def test_duplicate_and_manual_recovery_rules(watcher):
+    s3 = watcher.s3
+    s3.objects[f"{DAY}/input/dup.pdf"] = b"%PDF-"
+    s3.objects[f"{DAY}/processed/dup.pdf"] = b"%PDF-"
+    assert watcher.process_key(f"{DAY}/input/dup.pdf") == "DUPLICATE"
+    assert f"{DAY}/input/dup.pdf" not in s3.objects
+
+    s3.objects[f"{DAY}/input/stuck.pdf"] = b"%PDF-"
+    s3.objects[f"{DAY}/intermediary/stuck/manifest/job_summary.json"] = b"{}"
+    assert watcher.process_key(f"{DAY}/input/stuck.pdf") == "SKIPPED"
+    assert f"{DAY}/input/stuck.pdf" in s3.objects
+
+
+def test_dry_run_only_lists(tmp_path, monkeypatch):
+    monkeypatch.setattr(S3Watcher, "days_to_scan", lambda self: [date(2026, 10, 27)])
+    watcher = S3Watcher(WatcherConfig(bucket="b", work_dir=tmp_path, dry_run=True), s3=FakeS3())
+    watcher.s3.objects[f"{DAY}/input/a.pdf"] = b"%PDF-"
+    assert watcher.scan_once() == {f"{DAY}/input/a.pdf": "DRY_RUN"}
+    assert f"{DAY}/input/a.pdf" in watcher.s3.objects
+
+
+def test_config_accepts_vm_worker_env_names(monkeypatch):
+    for name in ("SIGCARE_S3_BUCKET", "SIGCARE_WATCH_INTERVAL_SECONDS", "SIGCARE_WATCH_DRY_RUN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("S3_BUCKET_NAME", "sigcare-test-bucket")
+    monkeypatch.setenv("S3_POLL_INTERVAL_SECONDS", "30")
+    monkeypatch.setenv("S3_WORKER_DRY_RUN", "true")
+    config = WatcherConfig.from_env()
+    assert (config.bucket, config.interval_seconds, config.dry_run) == ("sigcare-test-bucket", 30, True)

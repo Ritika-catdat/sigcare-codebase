@@ -37,12 +37,13 @@ services:
         max-file: "5"
 
   # Polls s3://$SIGCARE_S3_BUCKET/<yyyy>/<MMM>/<dd>/input/ and processes new PDFs.
-  watcher:
+  # Runs the pipeline itself; it does not call the api service.
+  worker:
     build:
       context: .
       dockerfile: Dockerfile
     image: sigcare-quality-api:${IMAGE_TAG:-latest}
-    container_name: sigcare-watcher
+    container_name: sigcare-worker
     restart: unless-stopped
     command: ["python", "-m", "sigcare_quality.s3_watcher"]
     env_file:
