@@ -36,5 +36,28 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # Polls s3://$SIGCARE_S3_BUCKET/<yyyy>/<MMM>/<dd>/input/ and processes new PDFs.
+  watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sigcare-quality-api:${IMAGE_TAG:-latest}
+    container_name: sigcare-watcher
+    restart: unless-stopped
+    command: ["python", "-m", "sigcare_quality.s3_watcher"]
+    env_file:
+      - .env
+    volumes:
+      - sigcare_outputs:/app/api_outputs
+    # No HTTP port; disable the image's curl healthcheck.
+    healthcheck:
+      disable: true
+    stop_grace_period: 10m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
 volumes:
   sigcare_outputs:

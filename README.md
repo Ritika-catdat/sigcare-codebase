@@ -22,6 +22,9 @@ docker compose up -d
 curl http://localhost:8000/health
 ```
 Upload a PDF: `curl -F "file=@data/input_pdf.pdf" http://localhost:8000/api/v1/quality-check`.
+This returns 202 with a `job_id` straight away; poll
+`GET /api/v1/quality-check/<job_id>` until `status` is `COMPLETED`, `COMPLETED_WITH_REVIEW` or `FAILED`.
+Check AWS/Textract setup with `curl http://localhost:8000/ready`.
 Staging (EC2) steps are in `DEPLOYMENT.md`. The `documents/` folder holds client
 infrastructure and login details and is git-ignored; never commit it.
 

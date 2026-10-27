@@ -22,10 +22,13 @@ dependencies = [
     "pytesseract>=0.3.10",
     # AWS Textract integration
     "boto3>=1.34.0,<2.0.0",
+    # IANA time zones for the S3 watcher's day folder (Europe/London)
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
 sigcare-quality = "sigcare_quality.cli:app"
+sigcare-s3-watcher = "sigcare_quality.s3_watcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

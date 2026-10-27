@@ -26,14 +26,17 @@ class TextractOCR:
                     continue
                 raise
             status = response.get('JobStatus')
-            if status in ('FAILED', 'PARTIAL_SUCCESS'):
+            if status == 'FAILED':
                 raise RuntimeError(f'Textract {status}: {response.get("StatusMessage", "")} {response.get("Warnings", [])}')
-            if status == 'SUCCEEDED':
+            if status in ('SUCCEEDED', 'PARTIAL_SUCCESS'):
                 break
             time.sleep(poll_seconds)
         blocks = list(response.get('Blocks', []))
         pages = response.get('DocumentMetadata', {}).get('Pages', 0)
-        warnings = response.get('Warnings', [])
+        warnings = list(response.get('Warnings', []))
+        if status == 'PARTIAL_SUCCESS':
+            # Keep what Textract returned; extract() turns warnings into review reasons.
+            warnings.append({'ErrorCode': 'PARTIAL_SUCCESS', 'Message': response.get('StatusMessage', '')})
         token = response.get('NextToken')
         while token:
             paged = self.client.get_document_analysis(JobId=job_id, MaxResults=1000, NextToken=token)

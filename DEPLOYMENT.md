@@ -16,9 +16,55 @@ git-ignored `documents/` folder and must never be committed.
 | Job outputs | `/app/api_outputs` (docker volume `sigcare_outputs`) |
 | Runs as | non-root user `sigcare` |
 
-Endpoints: `GET /health`, `POST /api/v1/quality-check` (PDF upload),
+Endpoints: `GET /health`, `GET /ready` (AWS credentials, Textract staging
+bucket, Tesseract), `POST /api/v1/quality-check` (PDF upload),
 `GET /api/v1/quality-check/{job_id}`, `.../{job_id}/artifacts`,
 `.../{job_id}/artifact/{path}`. Interactive docs at `/docs`.
+
+Processing runs in the background. `POST` returns **202** at once with a
+`job_id`. Poll `GET /api/v1/quality-check/{job_id}`: while it runs you get
+`{"status": "RUNNING", "stage": "FRONTSHEET|SPLITTING|QUALITY|TEXTRACT", "progress": "n/total"}`.
+When finished you get the full result (`COMPLETED`, `COMPLETED_WITH_REVIEW`)
+or `FAILED` with an `error`. A large PDF takes minutes, so never wait on the POST.
+
+Pipeline per job: Sigma front sheets are detected and **removed**, the remaining
+pages are split into prescriptions, each prescription gets a quality check and
+cleaned images, then AWS Textract (async, via the staging bucket) produces
+`processed/<prescription>/structured_extraction.json`.
+
+### S3 watcher (service `watcher`)
+
+`docker compose up -d` also starts `sigcare-watcher`. It runs
+`python -m sigcare_quality.s3_watcher` and checks the day's input folder every
+`SIGCARE_WATCH_INTERVAL_SECONDS` (default 60). The bucket is set per environment
+with `SIGCARE_S3_BUCKET` (test and prod differ). "Today" uses `SIGCARE_S3_TIMEZONE`
+(default Europe/London); yesterday is also checked (`SIGCARE_WATCH_LOOKBACK_DAYS=1`).
+
+```
+<bucket>/<yyyy>/<MMM>/<dd>/input/<file>.pdf                  drop new files here
+<bucket>/<yyyy>/<MMM>/<dd>/intermediary/<file>/original/<file>.pdf   unchanged copy, saved before cleaning
+<bucket>/<yyyy>/<MMM>/<dd>/intermediary/<file>/...           front-sheet report, split PDFs,
+                                                             cleaned pages, quality reports,
+                                                             structured_extraction.json, result.json
+<bucket>/<yyyy>/<MMM>/<dd>/intermediary/<file>/status.json   RUNNING / COMPLETED / FAILED
+<bucket>/<yyyy>/<MMM>/<dd>/processed/<file>.pdf              input moved here when done
+<bucket>/<yyyy>/<MMM>/<dd>/processed/<file>.json             final structured result
+```
+
+Folder format is `yyyy/MMM/dd`, e.g. `2026/Oct/27/input/Document_261012.pdf`
+(three-letter month, first letter capital; `SIGCARE_S3_MONTH_CASE=title`). Set
+`SIGCARE_S3_ROOT_PREFIX` if the date folders sit under a top-level folder.
+
+The input is moved to `processed/` only after every output is stored. If a file
+fails, it stays in `input/` and `intermediary/<file>/status.json` says `FAILED`
+with the error. The watcher then skips that file. Delete that `status.json` to
+retry it. Files that are not PDFs are logged and left alone.
+
+Useful commands:
+```bash
+docker compose logs -f watcher
+docker compose run --rm watcher python -m sigcare_quality.s3_watcher --once   # single scan
+```
 
 ## 2. Run locally
 
@@ -27,7 +73,10 @@ cp .env.example .env          # edit if needed; defaults work locally
 docker compose build
 docker compose up -d
 curl http://localhost:8000/health
+curl http://localhost:8000/ready
 curl -F "file=@sample.pdf" "http://localhost:8000/api/v1/quality-check?dpi=220"
+# -> {"job_id": "<id>", "status": "QUEUED", "status_url": "/api/v1/quality-check/<id>"}
+curl http://localhost:8000/api/v1/quality-check/<id>      # repeat until COMPLETED / FAILED
 docker compose logs -f api    # logs
 docker compose down           # stop (add -v to also delete job outputs)
 ```
@@ -102,12 +151,42 @@ Rollback = `git checkout <previous-commit> && docker compose up -d --build`.
 ```bash
 # copy a test PDF from S3 (use anonymised data only)
 aws s3 cp s3://sigcare-test-bucket/samples/test.pdf /tmp/test.pdf
-curl -F "file=@/tmp/test.pdf" http://localhost:8000/api/v1/quality-check | head -c 600
+curl -s http://localhost:8000/ready            # every check must be "ok": true
+curl -F "file=@/tmp/test.pdf" http://localhost:8000/api/v1/quality-check
+curl -s http://localhost:8000/api/v1/quality-check/<job_id> | head -c 600
+docker compose logs -f api                      # per-stage progress and timings
 ```
+
+### 3.4 AWS access for Textract
+
+The container uses the EC2 **instance IAM role**. It needs, for the staging
+bucket in `SIGCARE_TEXTRACT_STAGING_BUCKET` (same region as `AWS_REGION`):
+
+- `textract:StartDocumentAnalysis`, `textract:GetDocumentAnalysis`
+- `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `arn:aws:s3:::<bucket>/sigcare-temporary/*`
+- `s3:ListBucket` on `arn:aws:s3:::<bucket>` (used by the `/ready` check)
+
+For the S3 watcher, the role also needs, on `SIGCARE_S3_BUCKET`:
+`s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`
+on `arn:aws:s3:::<bucket>/*` (it reads `input/`, writes `intermediary/` and
+`processed/`, and deletes the input after moving it). If
+`SIGCARE_TEXTRACT_STAGING_BUCKET` is empty, Textract staging uses
+`SIGCARE_S3_BUCKET` under `sigcare-temporary/`.
+
+**Docker on EC2 and IMDSv2:** with the default hop limit of 1, a container
+cannot reach the instance metadata service, so it gets **no credentials**.
+Every Textract call then fails (`NoCredentialsError` in `/ready`). Fix once per instance:
+
+```bash
+aws ec2 modify-instance-metadata-options --instance-id <instance-id>     --http-tokens required --http-put-response-hop-limit 2
+```
+
+Add a lifecycle rule on the staging bucket that expires `sigcare-temporary/`
+after 1 day as a safeguard for objects that failed to delete.
 `aws` CLI needs the instance IAM role to allow `s3:GetObject` on the bucket
 (instance role, not personal keys – see infra docs).
 
-### 3.4 Useful operations
+### 3.5 Useful operations
 
 ```bash
 docker compose logs -f --tail=200 api     # live logs
@@ -119,7 +198,8 @@ docker volume ls | grep sigcare           # job outputs volume
 
 ## 4. Environment variables
 
-See `.env.example`. Only `SIGCARE_*` and `APP_ENV` are used by the code today.
+See `.env.example`. The code reads `SIGCARE_*`, `AWS_REGION`, `POLL_SECONDS`
+and `TIMEOUT_SECONDS`.
 The AWS / DB / ConX / Microsoft 365 entries are placeholders taken from the
 infrastructure documents so the staging `.env` is ready as the pipeline grows.
 On EC2 use the **instance IAM role** for AWS access; do not put access keys in `.env`.
