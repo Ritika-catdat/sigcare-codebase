@@ -7,7 +7,15 @@ name = "sigcare-document-quality"
 version = "0.1.0"
 description = "Local document integrity screening and image cleanup for Sigcare"
 requires-python = ">=3.11"
-dependencies = ["PyMuPDF>=1.24.0", "Pillow>=10.0.0", "opencv-python-headless>=4.9.0", "numpy>=1.26.0", "typer>=0.12.0", "rich>=13.7.0"]
+dependencies = [
+    "PyMuPDF>=1.24.0",
+    "Pillow>=10.0.0",
+    "opencv-python-headless>=4.9.0",
+    "numpy>=1.26.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "boto3>=1.34.0,<2.0.0",
+]
 
 [project.scripts]
 sigcare-quality = "sigcare_quality.cli:app"

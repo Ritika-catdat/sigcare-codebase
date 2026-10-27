@@ -30,6 +30,7 @@ import pytesseract
 # Keep using the user's existing quality + cleanup implementation.
 from .pipeline import run_quality_pipeline
 from .frontsheet import detect_frontsheets
+from .textract_integration import extract_prescription_pdf
 
 APP_NAME = "Sigcare Document Quality API"
 MAX_UPLOAD_BYTES = int(os.getenv("SIGCARE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
@@ -312,34 +313,98 @@ async def quality_check(
             if item.get("manual_review_required") is True
         ]
 
-        # Stage 3: existing quality assessment and cleanup pipeline for each split.
+        # Stage 3: quality assessment, cleanup, and AWS Textract extraction.
         results: list[dict[str, Any]] = []
+
         for number, split_file in enumerate(split_files, start=1):
-            output_dir = processed_dir / split_file.stem
-            report = run_quality_pipeline(
-                input_pdf=split_file,
-                output_dir=output_dir,
-                dpi=dpi,
-                create_cleanup=create_cleanup,
-            )
-            results.append({
-                "prescription_number": number,
-                "prescription_pdf": split_file.name,
-                "status": report.get("overall_status", "UNKNOWN"),
-                "report": report,
-                "quality_report_json": (output_dir / "quality_report.json").relative_to(OUTPUT_ROOT).as_posix(),
-                "quality_report_txt": (output_dir / "quality_report.txt").relative_to(OUTPUT_ROOT).as_posix(),
-                "cleaned_pages_directory": (
-                    (output_dir / "cleaned_pages").relative_to(OUTPUT_ROOT).as_posix()
-                    if create_cleanup else None
-                ),
-            })
+                output_dir = processed_dir / split_file.stem
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                # Step A: Run the existing quality assessment and cleanup.
+                report = run_quality_pipeline(
+                    input_pdf=split_file,
+                    output_dir=output_dir,
+                    dpi=dpi,
+                    create_cleanup=create_cleanup,
+                )
+
+                # Step B: Extract structured prescription data using AWS Textract.
+                extraction_json_path = output_dir / "structured_extraction.json"
+
+                try:
+                    extraction_result = extract_prescription_pdf(
+                        pdf_path=split_file,
+                        prescription_number=number,
+                        job_id=job_id,
+                    )
+
+                    extraction_status = (
+                        extraction_result.get("extraction_metadata", {}).get(
+                            "status", "REVIEW_REQUIRED"
+                        )
+                    )
+                    extraction_error = None
+
+                except Exception as exc:
+                    # Preserve the quality report even if Textract extraction fails.
+                    extraction_status = "ERROR"
+                    extraction_error = f"{type(exc).__name__}: {exc}"
+
+                    extraction_result = {
+                        "prescription_id": f"{job_id}-{number:03d}",
+                        "extraction_metadata": {
+                            "status": "ERROR",
+                            "review_reasons": [
+                                "Structured extraction failed; manual review is required."
+                            ],
+                        },
+                    }
+
+                # Save the structured extraction result locally as JSON.
+                extraction_json_path.write_text(
+                    json.dumps(extraction_result, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+                # Step C: Add quality and extraction results to the API response.
+                results.append({
+                    "prescription_number": number,
+                    "prescription_pdf": split_file.name,
+
+                    "status": report.get("overall_status", "UNKNOWN"),
+                    "report": report,
+
+                    "quality_report_json": (
+                        output_dir / "quality_report.json"
+                    ).relative_to(OUTPUT_ROOT).as_posix(),
+
+                    "quality_report_txt": (
+                        output_dir / "quality_report.txt"
+                    ).relative_to(OUTPUT_ROOT).as_posix(),
+
+                    "cleaned_pages_directory": (
+                        (output_dir / "cleaned_pages").relative_to(OUTPUT_ROOT).as_posix()
+                        if create_cleanup else None
+                    ),
+
+                    "extraction_status": extraction_status,
+                    "extraction_result": extraction_result,
+                    "extraction_error": extraction_error,
+
+                    "structured_extraction_json": (
+                        extraction_json_path.relative_to(OUTPUT_ROOT).as_posix()
+                    ),
+                })
 
         overall_status = (
-            "COMPLETED_WITH_REVIEW"
-            if any(r["status"] != "PASS" for r in results)
-            else "COMPLETED"
-        )
+    "COMPLETED_WITH_REVIEW"
+    if any(
+        r["status"] != "PASS"
+        or r["extraction_status"] != "EXTRACTED"
+        for r in results
+    )
+    else "COMPLETED"
+)
         response = {
             "job_id": job_id,
             "status": overall_status,
