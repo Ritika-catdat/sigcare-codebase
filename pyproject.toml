@@ -20,6 +20,8 @@ dependencies = [
     "python-multipart>=0.0.9",
     # Page-counter OCR fallback used by the splitter; needs the tesseract binary
     "pytesseract>=0.3.10",
+    # AWS Textract integration
+    "boto3>=1.34.0,<2.0.0",
 ]
 
 [project.scripts]
