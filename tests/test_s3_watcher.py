@@ -65,9 +65,10 @@ def _pdf_bytes():
 
 @pytest.fixture
 def watcher(tmp_path, monkeypatch):
-    def fake_extract(pdf_path, prescription_number, job_id):
-        return {"prescription_id": f"{job_id}-{prescription_number:03d}",
-                "extraction_metadata": {"status": "EXTRACTED", "review_reasons": []}}
+    def fake_extract(pdf_path, prescription_number, job_id, original_pdf_location, prescription_location):
+        return {"flag_for_review": False, "review_reasons": [],
+                "original_pdf_location": original_pdf_location,
+                "prescription_location": prescription_location}
 
     monkeypatch.setattr(processing, "extract_prescription_pdf", fake_extract)
     config = WatcherConfig(bucket="test-bucket", work_dir=tmp_path / "work")
@@ -86,7 +87,7 @@ def test_intermediary_layout_matches_vm_worker():
     assert intermediary_path("split_prescriptions/a_prescription_001.pdf") == "split_prescriptions/a_prescription_001.pdf"
     assert intermediary_path("processed/rx1/cleaned_pages/page_001.png") == "cleanup/rx1/page_001.png"
     assert intermediary_path("processed/rx1/quality_report.json") == "forensics/rx1/quality_report.json"
-    assert intermediary_path("processed/rx1/structured_extraction.json") == "extraction/rx1/structured_extraction.json"
+    assert intermediary_path("processed/rx1/prescription.json") == "extraction/rx1/prescription.json"
     assert intermediary_path("frontsheet_reports/frontsheet_report.json") == "reports/frontsheet_report.json"
     assert intermediary_path("input/Doc.pdf") is None
     assert intermediary_path("status.json") is None
@@ -111,7 +112,7 @@ def test_process_key_moves_input_and_writes_outputs(watcher):
     assert f"{INTER}/split_prescriptions/Doc 1_prescription_001.pdf" in keys
     assert f"{INTER}/cleanup/Doc 1_prescription_001/page_001.png" in keys
     assert f"{INTER}/forensics/Doc 1_prescription_001/quality_report.json" in keys
-    assert f"{INTER}/extraction/Doc 1_prescription_001/structured_extraction.json" in keys
+    assert f"{INTER}/extraction/Doc 1_prescription_001/prescription.json" in keys
     assert f"{INTER}/reports/frontsheet_report.json" in keys
     assert f"{INTER}/manifest/result.json" in keys
 
@@ -120,8 +121,12 @@ def test_process_key_moves_input_and_writes_outputs(watcher):
     assert result["s3"]["original_copy_key"] == f"{INTER}/original/Doc 1.pdf"
     assert result["results"][0]["source_pages"] == [1, 2]
     assert result["results"][0]["cleaned_pages_directory"] == f"{INTER}/cleanup/Doc 1_prescription_001"
-    assert result["results"][0]["structured_extraction_json"] == (
-        f"{INTER}/extraction/Doc 1_prescription_001/structured_extraction.json")
+    assert result["results"][0]["prescription_json"] == (
+        f"{INTER}/extraction/Doc 1_prescription_001/prescription.json")
+    prescription = result["results"][0]["prescription"]
+    assert prescription["original_pdf_location"] == f"s3://test-bucket/{DAY}/processed/Doc 1.pdf"
+    assert prescription["prescription_location"] == (
+        f"s3://test-bucket/{INTER}/split_prescriptions/Doc 1_prescription_001.pdf")
     summary = json.loads(s3.objects[f"{INTER}/manifest/job_summary.json"])
     assert summary["source_key"] == f"{DAY}/input/Doc 1.pdf" and summary["original_sha256"]
     status = json.loads(s3.objects[f"{INTER}/manifest/status.json"])

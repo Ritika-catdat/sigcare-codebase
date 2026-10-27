@@ -54,7 +54,11 @@ def extract_tables(doc, cfg):
                 score = previous['score'] * .75
             else:
                 review.append(f'Unclassified table on page {table.get("Page",1)} (block {table.get("Id")})')
-                table_meta.append({'table_id':table.get('Id'), 'page':table.get('Page'), 'type':None, 'header_score':round(score,3)})
+                # First rows as text so a reviewer can see what the table was without the raw OCR.
+                preview = [' | '.join(c.text if c else '' for c in cells_in_row(grid, r))
+                           for r in sorted({r for r, _ in grid})[:3]]
+                table_meta.append({'table_id':table.get('Id'), 'page':table.get('Page'), 'type':None,
+                                   'header_score':round(score,3), 'preview':preview})
                 previous = None
                 continue
         columns = max(c for _, c in grid)

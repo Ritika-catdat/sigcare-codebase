@@ -10,6 +10,7 @@ from .document_parser import Document
 from .patient_provider_extractor import extract_patient, extract_provider
 from .medication_table_extractor import extract_tables
 from .handwriting_detector import detect_handwriting
+from .output_contract import build_output
 
 LOG = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, indent=2, default=str).encode('utf-8')
 
 
-def process_one(bucket, key, config=None, s3=None, ocr=None, version=None):
+def process_one(bucket, key, config=None, s3=None, ocr=None, version=None, original_pdf_location=None, prescription_number=None):
     config = config or Config()
     if not key.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg', '.tif', '.tiff')):
         raise ValueError('Unsupported extension')
@@ -77,17 +78,36 @@ def process_one(bucket, key, config=None, s3=None, ocr=None, version=None):
     filename = PurePosixPath(key).stem
     output_name = f'{filename}-{source_id}.json'
     response = ocr.analyze_s3(bucket, key, version, config.poll_seconds, config.timeout_seconds)
-    source = {'prescription_id':source_id, 'bucket':bucket, 'key':key, 'version':version}
-    result = extract(response, source, config)
-    s3.put_object(Bucket=output_bucket, Key=config.output_prefix.strip('/')+'/'+output_name,
+    # TODO: Read this from preprocessing metadata: S3 URI of the processed
+    # original PDF containing all prescriptions, BEFORE it was split.
+    # Example: original_pdf_location = manifest_entry['processed_pdf_s3_uri']
+
+    # TODO: Read the prescription's sequence/index WITHIN that original PDF.
+    # Example: prescription_number = manifest_entry['prescription_number']
+    # Keep blank until available; source_id is only an internal technical ID.
+
+    # TODO: Map the exact S3 URI of the split PDF holding this prescription.
+    # Since `bucket` and `key` refer to the split prescription PDF here,
+    # its location can safely be constructed from them (or overridden in source).
+    prescription_location = f's3://{bucket}/{key}'
+    source = {'prescription_id':source_id, 'bucket':bucket, 'key':key,
+              'version':version, 'original_pdf_location':original_pdf_location,
+              'prescription_number':prescription_number,
+              'prescription_location':prescription_location}
+    internal = extract(response, source, config)
+    doc = Document(response)
+    handwriting = internal['extraction_metadata']['handwriting']
+    output_key = config.output_prefix.strip('/')+'/'+output_name
+    result = build_output(internal, doc, handwriting, source, output_bucket, output_key)
+    s3.put_object(Bucket=output_bucket, Key=output_key,
                   Body=json_bytes(result), ContentType='application/json', ServerSideEncryption='AES256')
-    if result['extraction_metadata']['status'] != 'EXTRACTED':
+    if result['flag_for_review']:
         s3.put_object(Bucket=output_bucket, Key=config.review_prefix.strip('/')+'/'+output_name,
                       Body=json_bytes(result), ContentType='application/json', ServerSideEncryption='AES256')
     if config.store_raw:
         s3.put_object(Bucket=output_bucket, Key=config.raw_prefix.strip('/')+'/'+output_name,
                       Body=json_bytes(response), ContentType='application/json', ServerSideEncryption='AES256')
-    LOG.info('Extracted %s status=%s', key, result['extraction_metadata']['status'])
+    LOG.info('Extracted %s review=%s', key, result['flag_for_review'])
     return result
 
 
@@ -98,6 +118,8 @@ def main():
     group.add_argument('--key')
     group.add_argument('--prefix')
     parser.add_argument('--version', default=None)
+    parser.add_argument('--original-pdf-location', default=None)
+    parser.add_argument('--prescription-number', default=None)
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args()
@@ -105,8 +127,10 @@ def main():
     cfg = Config()
     s3 = boto3.client('s3', region_name=cfg.region)
     if args.key:
-        process_one(args.bucket, args.key, cfg, s3=s3, version=args.version)
+        process_one(args.bucket, args.key, cfg, s3=s3, version=args.version, original_pdf_location=args.original_pdf_location, prescription_number=args.prescription_number)
         return
+    if args.original_pdf_location or args.prescription_number:
+        parser.error('--original-pdf-location and --prescription-number are supported with --key only; for batch input use process_one() with per-file metadata')
     paginator = s3.get_paginator('list_objects_v2')
     count = 0
     for page in paginator.paginate(Bucket=args.bucket, Prefix=args.prefix):

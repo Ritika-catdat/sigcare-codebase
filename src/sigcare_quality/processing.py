@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import fitz
 from PIL import Image
@@ -22,7 +22,8 @@ import pytesseract
 # Keep using the user's existing quality + cleanup implementation.
 from .pipeline import run_quality_pipeline
 from .frontsheet import detect_frontsheets
-from .textract_integration import extract_prescription_pdf
+from .textract_integration import extract_prescription_pdf, prescription_source
+from prescription_ocr.output_contract import failed_output
 
 # Textract jobs are mostly waiting on AWS, so several prescriptions run in parallel.
 TEXTRACT_CONCURRENCY = int(os.getenv("SIGCARE_TEXTRACT_CONCURRENCY", "4"))
@@ -255,29 +256,33 @@ class JobStatus:
         self.save()
 
 
-def extract_one(split_file: Path, number: int, job_id: str) -> tuple[dict[str, Any], str, str | None]:
+def extract_one(
+    split_file: Path,
+    number: int,
+    job_id: str,
+    original_pdf_location: str = "",
+    prescription_location: str = "",
+) -> tuple[dict[str, Any], str, str | None]:
     """Run Textract for one prescription; never raises so other results survive."""
     try:
         result = extract_prescription_pdf(
             pdf_path=split_file,
             prescription_number=number,
             job_id=job_id,
+            original_pdf_location=original_pdf_location,
+            prescription_location=prescription_location,
         )
-        status = result.get("extraction_metadata", {}).get("status", "REVIEW_REQUIRED")
+        status = "REVIEW_REQUIRED" if result.get("flag_for_review") else "EXTRACTED"
         return result, status, None
     except Exception as exc:
         LOG.exception("Textract extraction failed for %s", split_file.name)
         error = f"{type(exc).__name__}: {exc}"
-        return {
-            "prescription_id": f"{job_id}-{number:03d}",
-            "extraction_metadata": {
-                "status": "ERROR",
-                "review_reasons": [
-                    "Structured extraction failed; manual review is required.",
-                    error,
-                ],
-            },
-        }, "ERROR", error
+        source = prescription_source(split_file, number, job_id,
+                                     original_pdf_location, prescription_location)
+        return failed_output(source, [
+            "Structured extraction failed; manual review is required.",
+            error,
+        ]), "ERROR", error
 
 
 def process_document(
@@ -290,14 +295,20 @@ def process_document(
     create_cleanup: bool = True,
     split_stem: str = "uploaded",
     path_base: Path | None = None,
+    original_pdf_location: str = "",
+    artifact_location: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """Run the full pipeline on input_pdf, writing every artifact under job_dir.
 
     The source PDF is never modified. Artifact paths in the result are relative
     to path_base (default: the parent of job_dir). Writes job_dir/result.json and
     returns the same dict; raises if a non-recoverable stage fails.
+
+    original_pdf_location and artifact_location (relative path -> final location,
+    e.g. an s3:// URI) fill the links in each prescription's JSON.
     """
     path_base = path_base or job_dir.parent
+    artifact_location = artifact_location or (lambda relative_path: relative_path)
     split_dir = job_dir / "split_prescriptions"
     processed_dir = job_dir / "processed"
     frontsheet_dir = job_dir / "frontsheet_reports"
@@ -390,7 +401,8 @@ def process_document(
             thread_name_prefix="sigcare-textract",
         ) as pool:
             futures = {
-                pool.submit(extract_one, split_file, number, job_id): number
+                pool.submit(extract_one, split_file, number, job_id, original_pdf_location,
+                            artifact_location(relative(split_file))): number
                 for number, split_file in enumerate(split_files, start=1)
             }
             for future in as_completed(futures):
@@ -402,33 +414,31 @@ def process_document(
     for number, split_file in enumerate(split_files, start=1):
         output_dir = processed_dir / split_file.stem
         report = quality_reports[number - 1]
-        extraction_result, extraction_status, extraction_error = extractions[number]
+        prescription, extraction_status, extraction_error = extractions[number]
 
-        # Save the structured extraction result locally as JSON.
-        extraction_json_path = output_dir / "structured_extraction.json"
-        write_json(extraction_json_path, extraction_result)
+        # The prescription in the downstream contract; the full quality report
+        # stays in quality_report.json rather than being repeated here.
+        prescription_json_path = output_dir / "prescription.json"
+        write_json(prescription_json_path, prescription)
 
         results.append({
             "prescription_number": number,
-            "prescription_pdf": split_file.name,
             "source_pages": split_pages[number - 1],
-            "status": report.get("overall_status", "UNKNOWN"),
-            "report": report,
+            "quality_status": report.get("overall_status", "UNKNOWN"),
             "quality_report_json": relative(output_dir / "quality_report.json"),
-            "quality_report_txt": relative(output_dir / "quality_report.txt"),
             "cleaned_pages_directory": (
                 relative(output_dir / "cleaned_pages") if create_cleanup else None
             ),
             "extraction_status": extraction_status,
-            "extraction_result": extraction_result,
             "extraction_error": extraction_error,
-            "structured_extraction_json": relative(extraction_json_path),
+            "prescription_json": relative(prescription_json_path),
+            "prescription": prescription,
         })
 
     overall_status = (
         "COMPLETED_WITH_REVIEW"
         if any(
-            r["status"] != "PASS" or r["extraction_status"] != "EXTRACTED"
+            r["quality_status"] != "PASS" or r["extraction_status"] != "EXTRACTED"
             for r in results
         )
         else "COMPLETED"

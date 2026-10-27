@@ -54,12 +54,12 @@ def test_process_job_removes_front_sheets_and_extracts(tmp_path, monkeypatch):
     monkeypatch.setattr(api, "OUTPUT_ROOT", tmp_path)
     calls = []
 
-    def fake_extract(pdf_path, prescription_number, job_id):
+    def fake_extract(pdf_path, prescription_number, job_id, original_pdf_location, prescription_location):
         calls.append(pdf_path.name)
-        return {
-            "prescription_id": f"{job_id}-{prescription_number:03d}",
-            "extraction_metadata": {"status": "EXTRACTED", "review_reasons": []},
-        }
+        return {"flag_for_review": False, "review_reasons": [], "file_name": pdf_path.name,
+                "prescription_number": str(prescription_number),
+                "original_pdf_location": original_pdf_location,
+                "prescription_location": prescription_location}
 
     monkeypatch.setattr(processing, "extract_prescription_pdf", fake_extract)
 
@@ -83,7 +83,11 @@ def test_process_job_removes_front_sheets_and_extracts(tmp_path, monkeypatch):
     assert [r["source_pages"] for r in result["results"]] == [[2, 3], [4]]
     assert [r["extraction_status"] for r in result["results"]] == ["EXTRACTED", "EXTRACTED"]
     assert sorted(calls) == ["uploaded_prescription_001.pdf", "uploaded_prescription_002.pdf"]
-    assert (tmp_path / job_id / "processed" / "uploaded_prescription_001" / "structured_extraction.json").is_file()
+    assert (tmp_path / job_id / "processed" / "uploaded_prescription_001" / "prescription.json").is_file()
+    second = result["results"][1]["prescription"]
+    assert second["prescription_number"] == "2"
+    assert second["original_pdf_location"] == f"{job_id}/input/uploaded.pdf"
+    assert second["prescription_location"] == f"{job_id}/split_prescriptions/uploaded_prescription_002.pdf"
 
 
 def test_extraction_failure_is_recorded_not_raised(tmp_path, monkeypatch):
@@ -91,6 +95,10 @@ def test_extraction_failure_is_recorded_not_raised(tmp_path, monkeypatch):
     monkeypatch.delenv("SIGCARE_S3_BUCKET", raising=False)
     pdf = tmp_path / "p.pdf"
     _make_pdf(pdf, [("Patient name: A", "Page 1 of 1")])
-    result, status, error = processing.extract_one(pdf, 1, "b" * 32)
+    result, status, error = processing.extract_one(pdf, 1, "b" * 32, "s3://b/orig.pdf", "s3://b/p.pdf")
     assert status == "ERROR"
     assert "SIGCARE_TEXTRACT_STAGING_BUCKET" in error
+    # Same contract as a successful extraction, flagged with the reason.
+    assert result["flag_for_review"] is True and error in result["review_reasons"]
+    assert (result["file_name"], result["prescription_number"]) == ("p.pdf", "1")
+    assert result["prescription_location"] == "s3://b/p.pdf"

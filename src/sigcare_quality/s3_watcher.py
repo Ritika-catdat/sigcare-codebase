@@ -9,7 +9,7 @@ Bucket layout (agreed folder structure; the bucket differs between test and prod
         split_prescriptions/               split PDFs + split_report.txt
         cleanup/<prescription>/            cleaned page images used for OCR
         forensics/<prescription>/          quality_report.json / .txt
-        extraction/<prescription>/         structured_extraction.json (Textract)
+        extraction/<prescription>/         prescription.json (Textract, downstream contract)
         reports/                           frontsheet_report.json, frontsheets_removed.pdf
         manifest/status.json               RUNNING / COMPLETED / FAILED (+ error)
         manifest/result.json               full result (paths point at the S3 keys above)
@@ -127,8 +127,8 @@ def intermediary_path(relative: str) -> str | None:
         prescription, remainder = parts[1], parts[2:]
         if remainder[0] == "cleaned_pages":
             return "/".join(("cleanup", prescription) + remainder[1:])
-        if remainder == ("structured_extraction.json",):
-            return f"extraction/{prescription}/structured_extraction.json"
+        if remainder == ("prescription.json",):
+            return f"extraction/{prescription}/prescription.json"
         return "/".join(("forensics", prescription) + remainder)
     return f"reports/{parts[-1]}"
 
@@ -306,6 +306,9 @@ class S3Watcher:
                 dpi=self.config.dpi,
                 split_stem=stem,
                 path_base=job_dir,
+                # The original lands in processed/ once the run succeeds.
+                original_pdf_location=f"s3://{bucket}/{processed_key}",
+                artifact_location=lambda rel: f"s3://{bucket}/{intermediary}{intermediary_path(rel)}",
             )
             self._point_result_at_s3(result, intermediary)
             result["s3"] = s3_info
@@ -369,8 +372,7 @@ class S3Watcher:
         for name in ("split_report", "frontsheet_report"):
             result[name] = key(result.get(name))
         for item in result.get("results", []):
-            for name in ("quality_report_json", "quality_report_txt",
-                         "cleaned_pages_directory", "structured_extraction_json"):
+            for name in ("quality_report_json", "cleaned_pages_directory", "prescription_json"):
                 item[name] = key(item.get(name))
 
     def scan_once(self) -> dict[str, str]:

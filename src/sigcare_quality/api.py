@@ -77,6 +77,7 @@ def _process_job(
             dpi=dpi,
             create_cleanup=create_cleanup,
             path_base=OUTPUT_ROOT,
+            original_pdf_location=f"{job_id}/input/uploaded.pdf",
         )
     except Exception as exc:
         # Keep the job directory so partial outputs can be inspected.

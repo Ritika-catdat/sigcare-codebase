@@ -11,6 +11,8 @@ import boto3
 from botocore.config import Config as BotoConfig
 
 from prescription_ocr.config import Config
+from prescription_ocr.document_parser import Document
+from prescription_ocr.output_contract import build_output
 from prescription_ocr.prescription_extractor import extract
 from prescription_ocr.textract_ocr import TextractOCR
 
@@ -53,15 +55,34 @@ def _staging_bucket() -> str:
     return bucket
 
 
+def prescription_source(
+    pdf_path: Path,
+    prescription_number: int,
+    job_id: str,
+    original_pdf_location: str = "",
+    prescription_location: str = "",
+) -> dict[str, Any]:
+    """Source metadata for the downstream JSON contract (output_contract.build_output)."""
+    return {
+        "prescription_id": f"{job_id}-{prescription_number:03d}",
+        "key": pdf_path.name,
+        "prescription_number": prescription_number,
+        "original_pdf_location": original_pdf_location,
+        "prescription_location": prescription_location,
+    }
+
+
 def extract_prescription_pdf(
     pdf_path: Path,
     prescription_number: int,
     job_id: str,
+    original_pdf_location: str = "",
+    prescription_location: str = "",
 ) -> dict[str, Any]:
-    """Extract structured prescription data using a temporary private S3 object.
+    """Extract one prescription into the downstream JSON contract.
 
-    The temporary PDF is deleted in a finally block. The extracted JSON is
-    returned to the API and is not written to an S3 output prefix by this module.
+    Uses a temporary private S3 object that is deleted in a finally block.
+    Block/word ids and bounding boxes stay internal; only the contract is returned.
     """
     bucket = _staging_bucket()
 
@@ -97,15 +118,13 @@ def extract_prescription_pdf(
             timeout_seconds=config.timeout_seconds,
         )
 
-        source = {
-            "prescription_id": f"{job_id}-{prescription_number:03d}",
-            "prescription_number": prescription_number,
-            "source_file": pdf_path.name,
-        }
+        source = prescription_source(pdf_path, prescription_number, job_id,
+                                     original_pdf_location, prescription_location)
 
-        # Return structured JSON in the API response.
         # Do not persist raw Textract blocks or the source PDF to an output bucket.
-        return extract(response, source, config)
+        internal = extract(response, source, config)
+        return build_output(internal, Document(response), internal["extraction_metadata"]["handwriting"],
+                            source, bucket, key)
 
     finally:
         if uploaded:

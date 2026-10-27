@@ -30,7 +30,13 @@ or `FAILED` with an `error`. A large PDF takes minutes, so never wait on the POS
 Pipeline per job: Sigma front sheets are detected and **removed**, the remaining
 pages are split into prescriptions, each prescription gets a quality check and
 cleaned images, then AWS Textract (async, via the staging bucket) produces
-`processed/<prescription>/structured_extraction.json`.
+`processed/<prescription>/prescription.json` in the downstream contract from
+`prescription_ocr/output_contract.py` (flat patient fields, `in_possession`,
+`not_in_possession`, `allergy`, handwritten notes, `flag_for_review`,
+`review_reasons` (only filled when `flag_for_review` is true), `prescription_number`,
+`original_pdf_location`, `prescription_location`). Textract block/word ids and
+bounding boxes are not included. The same JSON is under `results[].prescription`
+in the job result.
 
 ### S3 worker (service `worker`)
 
@@ -48,7 +54,7 @@ yesterday is also checked (`SIGCARE_WATCH_LOOKBACK_DAYS=1`). The older names
 <yyyy>/<MMM>/<dd>/intermediary/<file>/split_prescriptions/ split PDFs + split_report.txt
 <yyyy>/<MMM>/<dd>/intermediary/<file>/cleanup/<rx>/        cleaned page images
 <yyyy>/<MMM>/<dd>/intermediary/<file>/forensics/<rx>/      quality reports
-<yyyy>/<MMM>/<dd>/intermediary/<file>/extraction/<rx>/     structured_extraction.json (Textract)
+<yyyy>/<MMM>/<dd>/intermediary/<file>/extraction/<rx>/     prescription.json (downstream contract)
 <yyyy>/<MMM>/<dd>/intermediary/<file>/reports/             front-sheet report, frontsheets_removed.pdf
 <yyyy>/<MMM>/<dd>/intermediary/<file>/manifest/            status.json, result.json, job_summary.json
 <yyyy>/<MMM>/<dd>/processed/<file>.pdf                     input moved here when done
