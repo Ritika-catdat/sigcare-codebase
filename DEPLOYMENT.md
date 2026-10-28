@@ -33,7 +33,7 @@ cleaned images, then AWS Textract (async, via the staging bucket) produces
 `processed/<prescription>/prescription.json` in the downstream contract from
 `prescription_ocr/output_contract.py` (flat patient fields, `in_possession`,
 `not_in_possession`, `allergy`, handwritten notes, `flag_for_review`,
-`review_reasons` (only filled when `flag_for_review` is true), `prescription_number`,
+`review_reason` (every reason the prescription needs review; `[]` when `flag_for_review` is false), `prescription_number`,
 `original_pdf_location`, `prescription_location`). Textract block/word ids and
 bounding boxes are not included. The same JSON is under `results[].prescription`
 in the job result.

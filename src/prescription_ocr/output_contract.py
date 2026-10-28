@@ -76,6 +76,40 @@ def _handwritten_notes(doc, handwriting):
     return notes
 
 
+
+def _review_reasons(values, notes_present, overall, in_possession, not_in_possession, prior_reasons, identification_confidence=100.0):
+    """Compute all independent review triggers. OCR confidence is stored on 0..100 scale."""
+    reasons = []
+    if notes_present:
+        reasons.append('Handwritten notes present')
+    for field, label in (('name','patient_name'), ('date_of_birth','date_of_birth'),
+                         ('age','age'), ('prisoner_number','prisoner_number')):
+        if not str(values.get(field) or '').strip():
+            reasons.append(f'Missing required patient field: {label}')
+    # 0.9 normalized threshold corresponds to 90.0 on Textract's 0–100 scale.
+    if not isinstance(overall, (int, float)):
+        reasons.append('Overall OCR confidence unavailable')
+    elif overall < 90.0:
+        reasons.append(f'Overall OCR confidence below 0.9: {overall / 100:.4f}')
+    if not isinstance(identification_confidence, (int, float)):
+        reasons.append('Identification OCR confidence unavailable')
+    elif identification_confidence < 90.0:
+        reasons.append(f'Identification OCR confidence below 0.9: {identification_confidence / 100:.4f}')
+    for section, records in (('in_possession', in_possession), ('not_in_possession', not_in_possession)):
+        for index, record in enumerate(records, start=1):
+            conf = record.get('record_ocr_confidence') if isinstance(record, dict) else None
+            if not isinstance(conf, (int, float)):
+                reasons.append(f'{section} record {index}: OCR confidence unavailable')
+            elif conf < 90.0:
+                reasons.append(f'{section} record {index}: OCR confidence below 0.9: {conf / 100:.4f}')
+    if not in_possession and not not_in_possession:
+        reasons.append('Neither in_possession nor not_in_possession contains a record')
+    # Retain upstream detected issues, e.g. handwritten tables or failed table classification.
+    for reason in prior_reasons or []:
+        if reason not in reasons:
+            reasons.append(reason)
+    return reasons
+
 def build_output(internal, doc, handwriting, source, output_bucket, output_key):
     patient = internal['patient']
     identity_fields = ('name','date_of_birth','age','prisoner_number','wing','landing','cell')
@@ -93,7 +127,10 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
     notes = _handwritten_notes(doc, handwriting)
     # Count all OCR WORD blocks exactly once (not table and field averages).
     overall = _avg([b.get('Confidence') for b in doc.blocks if b.get('BlockType')=='WORD'])
-    status = internal['extraction_metadata']['status']
+    metadata = internal.get('extraction_metadata') or {}
+    notes_present = bool(notes) or bool(handwriting.get('handwritten_notes', False))
+    identification_confidence = _avg(confidence)
+    review_reasons = _review_reasons(values, notes_present, overall, ip, nip, metadata.get('review_reasons'), identification_confidence)
     # TODO (preprocessing integration): provide the S3 URI of the ORIGINAL,
     # processed PDF from which the individual prescription PDF was split.
     # Set source['original_pdf_location'] from your preprocessing manifest.
@@ -107,7 +144,6 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
     # TODO (preprocessing integration): supply the S3 URI of the SPLIT PDF
     # actually being OCR-extracted. By default the input S3 object is that file.
     prescription_location = _str(source.get('prescription_location')) or f"s3://{source['bucket']}/{source['key']}"
-    flag_for_review = status != 'EXTRACTED'
     return {
         'patient_name': values['name'],
         'date_of_birth': values['date_of_birth'],
@@ -116,19 +152,18 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
         'wing': values['wing'],
         'Landing': landing,
         'cell': cell,
-        'identification_ocr_confidence': _avg(confidence),
+        'identification_ocr_confidence': identification_confidence,
         'in_possession': ip,
         'in_possession_record_count': len(ip),
         'not_in_possession': nip,
         'not_in_possession_record_count': len(nip),
         'allergy': allergy,
         'allergy_record_count': len(allergy),
-        'hand_written_notes_present': bool(notes) or handwriting.get('handwritten_notes', False),
+        'hand_written_notes_present': notes_present,
         'hand_written_notes': notes,
         'notes_records_count': len(notes),
-        'flag_for_review': flag_for_review,
-        # Reasons are only reported when the prescription needs review.
-        'review_reasons': list(internal['extraction_metadata'].get('review_reasons', [])) if flag_for_review else [],
+        'flag_for_review': bool(review_reasons) or metadata.get('status') != 'EXTRACTED',
+        'review_reason': review_reasons,
         'overall_ocr_confidence': overall,
         'file_name': PurePosixPath(source['key']).name,
         'prescription_number': prescription_number,
@@ -147,7 +182,7 @@ def failed_output(source, reasons):
         'allergy': [], 'allergy_record_count': 0,
         'hand_written_notes_present': False, 'hand_written_notes': [], 'notes_records_count': 0,
         'flag_for_review': True,
-        'review_reasons': list(reasons),
+        'review_reason': list(reasons),
         'overall_ocr_confidence': '',
         'file_name': PurePosixPath(source['key']).name,
         'prescription_number': _str(source.get('prescription_number')),

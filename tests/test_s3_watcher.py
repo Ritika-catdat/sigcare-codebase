@@ -66,7 +66,7 @@ def _pdf_bytes():
 @pytest.fixture
 def watcher(tmp_path, monkeypatch):
     def fake_extract(pdf_path, prescription_number, job_id, original_pdf_location, prescription_location):
-        return {"flag_for_review": False, "review_reasons": [],
+        return {"flag_for_review": False, "review_reason": [],
                 "original_pdf_location": original_pdf_location,
                 "prescription_location": prescription_location}
 

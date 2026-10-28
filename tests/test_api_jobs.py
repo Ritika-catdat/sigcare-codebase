@@ -56,7 +56,7 @@ def test_process_job_removes_front_sheets_and_extracts(tmp_path, monkeypatch):
 
     def fake_extract(pdf_path, prescription_number, job_id, original_pdf_location, prescription_location):
         calls.append(pdf_path.name)
-        return {"flag_for_review": False, "review_reasons": [], "file_name": pdf_path.name,
+        return {"flag_for_review": False, "review_reason": [], "file_name": pdf_path.name,
                 "prescription_number": str(prescription_number),
                 "original_pdf_location": original_pdf_location,
                 "prescription_location": prescription_location}
@@ -99,6 +99,6 @@ def test_extraction_failure_is_recorded_not_raised(tmp_path, monkeypatch):
     assert status == "ERROR"
     assert "SIGCARE_TEXTRACT_STAGING_BUCKET" in error
     # Same contract as a successful extraction, flagged with the reason.
-    assert result["flag_for_review"] is True and error in result["review_reasons"]
+    assert result["flag_for_review"] is True and error in result["review_reason"]
     assert (result["file_name"], result["prescription_number"]) == ("p.pdf", "1")
     assert result["prescription_location"] == "s3://b/p.pdf"
