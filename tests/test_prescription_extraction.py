@@ -197,3 +197,22 @@ def test_signature_read_as_a_single_letter_is_not_a_note():
     result = detect_handwriting(doc, [], Config())
     assert result['top_handwriting_word_ids'] == []
     assert _handwritten_notes(doc, result) == []
+
+
+def test_sign_off_and_possession_status_boxes_are_ignored():
+    blocks = []
+    _table(blocks, 'ta', 1, [['Drug name', 'Dose', 'Medication type', 'Possession quantity'],
+                             ['Laxido', '1 sachet', 'Regular', '14 sachets']])
+    _table(blocks, 'tb', 1, [['Clinically screened by:', ''], ['Dispensed by:', ''], ['Checked by:', '']], top=.7)
+    _table(blocks, 'tc', 1, [['Medication Possession Status:'], ['Not in possession']], top=.1)
+    result = extract({'Blocks': blocks, 'Pages': 1}, {'prescription_id': 'boxes'}, Config())
+    reasons = result['extraction_metadata']['review_reasons']
+    assert not any('Unclassified table' in r for r in reasons)
+    assert [r['drug_name'] for r in result['in_possession_medicines']] == ['Laxido']
+
+
+def test_unrecognised_table_with_a_drug_column_is_still_flagged():
+    blocks = []
+    _table(blocks, 'ta', 1, [['Drug name', 'Strength'], ['Laxido', '1 sachet']])
+    result = extract({'Blocks': blocks, 'Pages': 1}, {'prescription_id': 'odd'}, Config(min_table_header_score=.95))
+    assert any('Unclassified table' in r for r in result['extraction_metadata']['review_reasons'])

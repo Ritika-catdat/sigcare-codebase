@@ -4,6 +4,8 @@ from .schemas import TABLES, CRITICAL_FIELDS, map_headers, classify, match_score
 # line of a wrapped header (e.g. "Notes | date | duration | type"), not a medicine.
 HEADER_WORDS = {w for schema in TABLES.values() for aliases in schema.values()
                 for alias in aliases for w in norm(alias).split()} | {'printed', 'by'}
+# Columns that make an unrecognised table worth flagging rather than ignoring.
+MEDICINE_COLUMNS = {'drug_name', 'administration_dose_time_description', 'allergy_or_sensitivity'}
 
 
 def is_patient_table(grid):
@@ -73,11 +75,17 @@ def extract_tables(doc, cfg):
                 header_row = 0
                 score = previous['score'] * .75
             else:
-                review.append(f'Unclassified table on page {table.get("Page",1)} (block {table.get("Id")})')
+                # Only a table with a medicine/allergy column is worth a reviewer's time. Other
+                # boxes on the form ("Clinically screened by", "Medication Possession Status")
+                # are not part of the output and are ignored.
+                medicine_like = bool(set(mapping) & MEDICINE_COLUMNS)
+                if medicine_like:
+                    review.append(f'Unclassified table on page {table.get("Page",1)} (block {table.get("Id")})')
                 # First rows as text so a reviewer can see what the table was without the raw OCR.
                 preview = [' | '.join(c.text if c else '' for c in cells_in_row(grid, r))
                            for r in sorted({r for r, _ in grid})[:3]]
-                table_meta.append({'table_id':table.get('Id'), 'page':table.get('Page'), 'type':None,
+                table_meta.append({'table_id':table.get('Id'), 'page':table.get('Page'),
+                                   'type':None if medicine_like else 'ignored',
                                    'header_score':round(score,3), 'preview':preview})
                 previous = None
                 continue
