@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import os
 import fitz
 from PIL import Image
 
@@ -27,7 +28,26 @@ def inspect_pdf(path: Path) -> dict:
         result["errors"].append(f"PDF could not be opened: {type(exc).__name__}: {exc}")
     return result
 
+# Longest rendered edge in pixels. A4 at 300 dpi is 3508 px, so normal pages are
+# unaffected; oversized pages (e.g. photos embedded at 72 dpi) would otherwise
+# render to images so large that OCR and cleanup take minutes per page.
+MAX_RENDER_PX = int(os.getenv("SIGCARE_MAX_RENDER_PX", "3500"))
+
+
+def page_pixmap(page: fitz.Page, dpi: float) -> fitz.Pixmap:
+    """Render a page at dpi, lowered if needed so no edge exceeds MAX_RENDER_PX."""
+    longest_points = max(page.rect.width, page.rect.height)
+    if longest_points > 0:
+        dpi = min(dpi, MAX_RENDER_PX * 72 / longest_points)
+    zoom = dpi / 72
+    return page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+
+
+def page_image(page: fitz.Page, dpi: float) -> Image.Image:
+    pix = page_pixmap(page, dpi)
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+
 def render_page(doc: fitz.Document, index: int, dpi: int = 220):
     page = doc.load_page(index)
-    pix = page.get_pixmap(dpi=dpi, alpha=False)
-    return page, Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    return page, page_image(page, dpi)

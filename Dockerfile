@@ -5,10 +5,14 @@
 
 FROM python:3.11-slim AS runtime
 
+# OMP_THREAD_LIMIT=1: Tesseract's own OpenMP threads spin-wait and fight each
+# other in containers; the pipeline runs several single-threaded Tesseract
+# processes in parallel instead (SIGCARE_OCR_WORKERS).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    OMP_THREAD_LIMIT=1
 
 # System packages:
 #  - tesseract-ocr: needed by pytesseract when page counters are not in the PDF text layer

@@ -102,3 +102,35 @@ def test_extraction_failure_is_recorded_not_raised(tmp_path, monkeypatch):
     assert result["flag_for_review"] is True and error in result["review_reason"]
     assert (result["file_name"], result["prescription_number"]) == ("p.pdf", "1")
     assert result["prescription_location"] == "s3://b/p.pdf"
+
+
+def test_oversized_pages_are_rendered_within_the_pixel_cap():
+    from sigcare_quality.integrity import MAX_RENDER_PX, page_image
+    doc = fitz.open()
+    doc.new_page(width=5000, height=7000)   # ~70 x 97 inches
+    doc.new_page()                           # A4-ish 595 x 842 points
+    huge, normal = doc[0], doc[1]
+    assert max(page_image(huge, 250).size) <= MAX_RENDER_PX
+    # Normal pages keep their requested resolution.
+    assert max(page_image(normal, 250).size) == round(842 * 250 / 72)
+    doc.close()
+
+
+def test_frontsheet_ocr_timeout_marks_page_for_review(tmp_path, monkeypatch):
+    from sigcare_quality import frontsheet
+    pdf = tmp_path / "in.pdf"
+    _make_pdf(pdf, [("page one", None), ("page two", None), ("page three", None)])
+    calls = iter(["text one", RuntimeError("Tesseract process timeout"), FRONT_SHEET_TEXT])
+
+    def fake_ocr(image):
+        value = next(calls)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(frontsheet, "ocr_image", fake_ocr)
+    monkeypatch.setattr(frontsheet, "OCR_WORKERS", 1)  # deterministic call order
+    results = frontsheet.detect_frontsheets(pdf, tmp_path / "report.json")
+    assert [r["source_page"] for r in results] == [1, 2, 3]
+    assert results[1]["manual_review_required"] and "timeout" in results[1]["error"]
+    assert results[2]["likely_frontsheet"] is True

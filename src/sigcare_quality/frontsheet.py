@@ -1,10 +1,15 @@
 
+import json
+import os
 import re
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import fitz
 import pytesseract
-from PIL import Image
+
+from .integrity import page_image
 
 
 # These are initial indicators, not definitive proof of a front sheet.
@@ -21,15 +26,25 @@ FRONTSHEET_PATTERNS = {
 }
 
 
-def extract_page_text(page, dpi=250):
-    """Run local Tesseract OCR on a rendered PDF page."""
-    pix = page.get_pixmap(dpi=dpi, alpha=False)
-    image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+# Tesseract processes run in parallel, one page each (pair with OMP_THREAD_LIMIT=1).
+OCR_WORKERS = max(1, int(os.getenv("SIGCARE_OCR_WORKERS", "3")))
+# A normal page takes a few seconds; a page that takes longer than this is
+# recorded as an OCR error (manual review) instead of stalling the whole file.
+OCR_TIMEOUT_SECONDS = int(os.getenv("SIGCARE_OCR_TIMEOUT_SECONDS", "90"))
 
+
+def ocr_image(image):
+    """Run local Tesseract OCR on a page image, bounded by OCR_TIMEOUT_SECONDS."""
     return pytesseract.image_to_string(
         image,
         config="--psm 11",
+        timeout=OCR_TIMEOUT_SECONDS,
     ).strip()
+
+
+def extract_page_text(page, dpi=250):
+    """Run local Tesseract OCR on a rendered PDF page."""
+    return ocr_image(page_image(page, dpi))
 
 
 
@@ -89,32 +104,45 @@ def detect_frontsheets(input_pdf, output_json, dpi=250):
 
     results = []
 
-    with fitz.open(input_path) as document:
+    def collect(index, future):
+        try:
+            text = future.result()
+            results.append({
+                "source_page": index + 1,
+                "ocr_text": text,
+                "ocr_engine": "Tesseract",
+                **classify_frontsheet(text),
+                "error": None,
+            })
+        except Exception as exc:
+            results.append({
+                "source_page": index + 1,
+                "ocr_text": "",
+                "ocr_engine": "Tesseract",
+                "likely_frontsheet": False,
+                "matched_indicators": [],
+                "manual_review_required": True,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    # PyMuPDF is not thread-safe, so pages are rendered here one at a time and
+    # only the Tesseract calls run in parallel. A small window of rendered pages
+    # keeps memory bounded on long documents.
+    pending = deque()
+    with fitz.open(input_path) as document, ThreadPoolExecutor(
+        max_workers=OCR_WORKERS, thread_name_prefix="sigcare-ocr"
+    ) as pool:
         for index, page in enumerate(document):
             try:
-                text = extract_page_text(page, dpi=dpi)
-                classification = classify_frontsheet(text)
-
-                results.append({
-                    "source_page": index + 1,
-                    "ocr_text": text,
-                    "ocr_engine": "Tesseract",
-                    **classification,
-                    "error": None,
-                })
-
+                future = pool.submit(ocr_image, page_image(page, dpi))
             except Exception as exc:
-                results.append({
-                    "source_page": index + 1,
-                    "ocr_text": "",
-                    "ocr_engine": "Tesseract",
-                    "likely_frontsheet": False,
-                    "matched_indicators": [],
-                    "manual_review_required": True,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-
-    import json
+                future = Future()
+                future.set_exception(exc)
+            pending.append((index, future))
+            if len(pending) >= OCR_WORKERS * 2:
+                collect(*pending.popleft())
+        while pending:
+            collect(*pending.popleft())
 
     output_path.write_text(
         json.dumps(results, indent=2, ensure_ascii=False),

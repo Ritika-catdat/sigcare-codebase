@@ -21,7 +21,8 @@ import pytesseract
 
 # Keep using the user's existing quality + cleanup implementation.
 from .pipeline import run_quality_pipeline
-from .frontsheet import detect_frontsheets
+from .frontsheet import detect_frontsheets, ocr_image
+from .integrity import page_image
 from .textract_integration import extract_prescription_pdf, prescription_source
 from prescription_ocr.output_contract import failed_output
 
@@ -56,8 +57,7 @@ def _footer_text(page: fitz.Page) -> str:
 
 
 def _ocr_page_for_marker(page: fitz.Page, include_upright: bool = True) -> str:
-    pix = page.get_pixmap(dpi=250, alpha=False)
-    image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    image = page_image(page, 250)
     if image.width < 1600:
         scale = 1600 / image.width
         image = image.resize((int(image.width * scale), int(image.height * scale)))
@@ -71,7 +71,12 @@ def _ocr_page_for_marker(page: fitz.Page, include_upright: bool = True) -> str:
         orientations.insert(0, image)
 
     for orientation in orientations:
-        text = pytesseract.image_to_string(orientation, config="--psm 11")
+        try:
+            text = ocr_image(orientation)
+        except RuntimeError as exc:
+            # Timed out: the other orientations of the same page would too.
+            LOG.warning("Page-counter OCR stopped on page %d: %s", page.number + 1, exc)
+            return ""
         if _find_page_marker(text)[0] is not None:
             return text
     return ""
@@ -376,39 +381,44 @@ def process_document(
         job_id, len(split_files), time.monotonic() - stage_start,
     )
 
-    # Stage 3: quality assessment and cleanup (CPU bound, sequential).
-    stage_start = time.monotonic()
-    quality_reports: list[dict[str, Any]] = []
-    for number, split_file in enumerate(split_files, start=1):
-        status.update(stage="QUALITY", progress=f"{number}/{len(split_files)}")
-        output_dir = processed_dir / split_file.stem
-        output_dir.mkdir(parents=True, exist_ok=True)
-        quality_reports.append(run_quality_pipeline(
-            input_pdf=split_file,
-            output_dir=output_dir,
-            dpi=dpi,
-            create_cleanup=create_cleanup,
-        ))
-    LOG.info("[%s] quality + cleanup done (%.1fs)", job_id, time.monotonic() - stage_start)
-
-    # Stage 4: AWS Textract extraction, several prescriptions in parallel.
+    # Stages 3 and 4 overlap: Textract only needs the split PDFs, so its jobs
+    # (mostly waiting on AWS) run in background threads while quality and
+    # cleanup use the CPU here.
     stage_start = time.monotonic()
     extractions: dict[int, tuple[dict[str, Any], str, str | None]] = {}
-    if split_files:
-        status.update(stage="TEXTRACT", progress=f"0/{len(split_files)}")
-        with ThreadPoolExecutor(
-            max_workers=max(1, TEXTRACT_CONCURRENCY),
-            thread_name_prefix="sigcare-textract",
-        ) as pool:
-            futures = {
-                pool.submit(extract_one, split_file, number, job_id, original_pdf_location,
-                            artifact_location(relative(split_file))): number
-                for number, split_file in enumerate(split_files, start=1)
-            }
-            for future in as_completed(futures):
-                extractions[futures[future]] = future.result()
-                status.update(progress=f"{len(extractions)}/{len(split_files)}")
-    LOG.info("[%s] Textract extraction done (%.1fs)", job_id, time.monotonic() - stage_start)
+    quality_reports: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(
+        max_workers=max(1, TEXTRACT_CONCURRENCY),
+        thread_name_prefix="sigcare-textract",
+    ) as pool:
+        futures = {
+            pool.submit(extract_one, split_file, number, job_id, original_pdf_location,
+                        artifact_location(relative(split_file))): number
+            for number, split_file in enumerate(split_files, start=1)
+        }
+
+        # Stage 3: quality assessment and cleanup (CPU bound, sequential).
+        for number, split_file in enumerate(split_files, start=1):
+            status.update(stage="QUALITY", progress=f"{number}/{len(split_files)}")
+            output_dir = processed_dir / split_file.stem
+            output_dir.mkdir(parents=True, exist_ok=True)
+            quality_reports.append(run_quality_pipeline(
+                input_pdf=split_file,
+                output_dir=output_dir,
+                dpi=dpi,
+                create_cleanup=create_cleanup,
+            ))
+        LOG.info("[%s] quality + cleanup done (%.1fs)", job_id, time.monotonic() - stage_start)
+
+        # Stage 4: collect the Textract results.
+        done = sum(future.done() for future in futures)
+        if split_files:
+            status.update(stage="TEXTRACT", progress=f"{done}/{len(split_files)}")
+        for future in as_completed(futures):
+            extractions[futures[future]] = future.result()
+            status.update(progress=f"{len(extractions)}/{len(split_files)}")
+    LOG.info("[%s] Textract extraction done (%.1fs since quality started)",
+             job_id, time.monotonic() - stage_start)
 
     results: list[dict[str, Any]] = []
     for number, split_file in enumerate(split_files, start=1):
