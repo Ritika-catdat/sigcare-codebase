@@ -93,3 +93,107 @@ def test_landing_in_patient_table_and_combined_cell():
             blocks.extend([w,c]);cells.append(c['Id'])
         blocks.append(block('TABLE','table',Relationships=[{'Type':'CHILD','Ids':cells}]))
         assert extract_patient(Document({'Blocks':blocks}))['landing_cell']['value']=='A Wing / Cell 4'
+
+
+def _table(blocks, ident, page, rows, top=.4):
+    """Append a TABLE with one WORD per cell; rows is a list of lists of cell texts."""
+    cells = []
+    for r, texts in enumerate(rows, 1):
+        for c, txt in enumerate(texts, 1):
+            cid = f'{ident}c{r}_{c}'
+            ids = []
+            if txt:
+                ids = [f'{ident}w{r}_{c}']
+                blocks.append(block('WORD', ids[0], Page=page, Text=txt, TextType='PRINTED'))
+            blocks.append(block('CELL', cid, Page=page, RowIndex=r, ColumnIndex=c,
+                                Relationships=[{'Type': 'CHILD', 'Ids': ids}]))
+            cells.append(cid)
+    blocks.append(block('TABLE', ident, Page=page, Relationships=[{'Type': 'CHILD', 'Ids': cells}],
+                        Geometry={'BoundingBox': {'Top': top, 'Left': 0, 'Width': 1, 'Height': .2}}))
+
+
+IP_HEADER = ['Drug name', 'Dose', 'Script', 'Start', 'Days', 'Quantity', 'Medication', 'Possession', 'Possession', 'Medication', 'Prescriber']
+IP_HEADER_2 = ['', '', 'Notes', 'date', 'duration', '', 'type', 'quantity', 'interval', 'notes', 'name']
+
+
+def test_in_possession_table_split_over_two_pages_gives_one_record():
+    blocks = []
+    # Page 2: only the (two-line) header fits; page 3: header repeated + the medicine row.
+    _table(blocks, 'ta', 2, [IP_HEADER, IP_HEADER_2, ['', '|', '', '', '', '', '', '', '', '', '']])
+    _table(blocks, 'tb', 3, [IP_HEADER, IP_HEADER_2,
+                             ['Laxido Orange', '1 sachet', '1 sachet, 2 times', '13 Oct 2026', '10 day(s)',
+                              '19 sachet', 'Regular', '14 sachets', '7 days', '', 'IGWE, Nono']])
+    result = extract({'Blocks': blocks, 'Pages': 3}, {'prescription_id': 'split'}, Config())
+    records = result['in_possession_medicines']
+    assert [r['drug_name'] for r in records] == ['Laxido Orange']
+    assert records[0]['possession_interval'] == '7 days'
+
+
+def test_row_continued_on_next_page_is_merged_into_previous_record():
+    blocks = []
+    _table(blocks, 'ta', 1, [['Drug name', 'Dose', 'Medication type', 'Possession quantity', 'Medication notes'],
+                             ['Laxido', '1 sachet', 'Regular', '14 sachets', 'Take with']])
+    _table(blocks, 'tb', 2, [['', '', '', '', 'plenty of water']])
+    result = extract({'Blocks': blocks, 'Pages': 2}, {'prescription_id': 'cont'}, Config())
+    records = result['in_possession_medicines']
+    assert len(records) == 1
+    assert records[0]['medication_notes'] == 'Take with plenty of water'
+
+
+def _line(blocks, ident, text, top, left=.05, page=1, hand=False):
+    ids = []
+    for i, word in enumerate(text.split()):
+        wid = f'{ident}w{i}'
+        blocks.append(block('WORD', wid, Page=page, Text=word,
+                            TextType='HANDWRITING' if hand else 'PRINTED',
+                            Geometry={'BoundingBox': {'Top': top, 'Left': left + i * .05, 'Width': .04, 'Height': .02}}))
+        ids.append(wid)
+    blocks.append(block('LINE', ident, Page=page, Text=text,
+                        Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                        Geometry={'BoundingBox': {'Top': top, 'Left': left, 'Width': .3, 'Height': .02}}))
+
+
+def test_signature_is_not_a_handwritten_note():
+    from prescription_ocr.handwriting_detector import detect_handwriting
+    blocks = []
+    _line(blocks, 'printed', 'Printed by Dr Nono Igwe', .05)
+    _line(blocks, 'sig', 'Dr lgwe', .22, left=.4, hand=True)          # signature showing through
+    _line(blocks, 'label', 'Signed:', .70, page=1)
+    _line(blocks, 'sig2', 'Qi', .67, left=.2, hand=True)              # scrawl above "Signed:"
+    doc = Document({'Blocks': blocks})
+    result = detect_handwriting(doc, [], Config())
+    assert result['top_handwriting_word_ids'] == []
+    assert result['handwritten_notes'] is False
+    assert set(result['signature_word_ids']) == {'sigw0', 'sigw1', 'sig2w0'}
+
+
+def test_real_handwritten_note_is_still_reported():
+    from prescription_ocr.handwriting_detector import detect_handwriting
+    blocks = []
+    _line(blocks, 'printed', 'Printed by Dr Nono Igwe', .05)
+    _line(blocks, 'note', 'Patient refused dose', .15, left=.4, hand=True)
+    result = detect_handwriting(Document({'Blocks': blocks}), [], Config())
+    assert result['handwritten_notes'] is True
+    assert result['signature_word_ids'] == []
+
+
+def test_blank_landing_does_not_take_the_cell_label_below_it():
+    from prescription_ocr.patient_provider_extractor import extract_patient
+    blocks = []
+    _table(blocks, 'pt', 1, [['Patient name:', 'Mr A'], ['Prisoner number:', '111'],
+                             ['Landing:', ''], ['Cell:', 'D103']], top=.1)
+    patient = extract_patient(Document({'Blocks': blocks}))
+    assert patient['landing']['value'] is None
+    assert patient['cell']['value'] == 'D103'
+
+
+def test_signature_read_as_a_single_letter_is_not_a_note():
+    from prescription_ocr.handwriting_detector import detect_handwriting
+    from prescription_ocr.output_contract import _handwritten_notes
+    blocks = []
+    _line(blocks, 'printed', 'Printed by David Antwi-Boasiako', .05)
+    _line(blocks, 'sig', 'a', .12, left=.7, hand=True)   # signature showing through, no label read
+    doc = Document({'Blocks': blocks})
+    result = detect_handwriting(doc, [], Config())
+    assert result['top_handwriting_word_ids'] == []
+    assert _handwritten_notes(doc, result) == []

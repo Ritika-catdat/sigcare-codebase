@@ -1,5 +1,10 @@
 from .schemas import TABLES, CRITICAL_FIELDS, map_headers, classify, match_score, norm
 
+# Every word used in a column header. A row made only of these words is the second
+# line of a wrapped header (e.g. "Notes | date | duration | type"), not a medicine.
+HEADER_WORDS = {w for schema in TABLES.values() for aliases in schema.values()
+                for alias in aliases for w in norm(alias).split()} | {'printed', 'by'}
+
 
 def is_patient_table(grid):
     vals = [c.text for c in grid.values() if c.text]
@@ -10,6 +15,21 @@ def is_patient_table(grid):
 def cells_in_row(grid, r):
     maxcol = max((c for _, c in grid), default=0)
     return [grid.get((r, col)) for col in range(1, maxcol + 1)]
+
+
+def is_header_fragment(cells):
+    texts = [norm(c.text) for c in cells if c and norm(c.text)]
+    return bool(texts) and all(set(t.split()) <= HEADER_WORDS for t in texts)
+
+
+def merge_into(record, fields, provenance):
+    """Append a row that continues the previous page's last row (a row split by a page break)."""
+    for field, value in fields.items():
+        if not value:
+            continue
+        record[field] = f'{record[field]} {value}' if record.get(field) else value
+        before = record['_provenance'].get(field)
+        record['_provenance'][field] = {'components': [before, provenance[field]]} if before else provenance[field]
 
 
 def header_for(grid, title, context):
@@ -66,27 +86,49 @@ def extract_tables(doc, cfg):
         meta = {'table_id':table['Id'],'page':table.get('Page',1),'type':kind,
                 'header_score':round(score,3), 'row_count':0}
         table_meta.append(meta)
+        first_row = True
         for r in sorted({r for r,_ in grid}):
             if r <= header_row:
                 continue
             cells = cells_in_row(grid, r)
             headers = [c.text if c else '' for c in cells]
-            if len(map_headers(headers, TABLES[kind])) >= max(2, len(mapping)//2):
-                continue  # repeated header
+            if len(map_headers(headers, TABLES[kind])) >= max(2, len(mapping)//2) or is_header_fragment(cells):
+                continue  # repeated header, or the wrapped second line of the header
             fields, provenance = {}, {}
             for field in TABLES[kind]:
                 ix = mapping.get(field)
                 cell = cells[ix] if ix is not None and ix < len(cells) else None
-                fields[field] = cell.text.strip() if cell and cell.text.strip() else None
-                provenance[field] = doc.provenance(cell.block_ids, cell.word_ids, cell.page) if cell and cell.text else None
+                # Cells holding only ruling lines or stray marks ("|", "-") count as empty.
+                fields[field] = cell.text.strip() if cell and norm(cell.text) else None
+                provenance[field] = doc.provenance(cell.block_ids, cell.word_ids, cell.page) if fields[field] else None
             if not any(v for v in fields.values()):
                 continue
+            last = result[kind][-1] if result[kind] else None
+            partial = not fields.get('drug_name') and not any(fields.get(f) for f in CRITICAL_FIELDS[kind])
+            continues = partial and first_row and last and last['_source']['page'] < table.get('Page', 1)
+            first_row = False
+            if continues:
+                # Same table carried over a page break: complete the previous record instead
+                # of emitting a second, mostly blank one.
+                merge_into(last, fields, provenance)
+                continue
+            if partial:
+                # No medicine/allergy and nothing to attach it to (e.g. an empty table whose
+                # rows continue on the next page): kept for audit, not emitted as a record.
+                meta.setdefault('skipped_rows', []).append(' | '.join(v for v in fields.values() if v))
+                continue
             record = {**fields, '_provenance': provenance, '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
-            missing = [f for f in CRITICAL_FIELDS[kind] if not fields.get(f)]
-            low_conf = [f for f, p in provenance.items() if p and p['ocr_confidence'] is not None and p['ocr_confidence'] < cfg.min_cell_confidence]
-            record['_review_reasons'] = ([f'Missing critical fields: {", ".join(sorted(missing))}'] if missing else []) + ([f'Low OCR confidence: {", ".join(low_conf)}'] if low_conf else [])
             result[kind].append(record)
             meta['row_count'] += 1
+    # Review reasons are computed once all pages are read, so a record completed by a
+    # continuation row is judged on its merged values.
+    for kind, records in result.items():
+        for record in records:
+            missing = [f for f in CRITICAL_FIELDS[kind] if not record.get(f)]
+            low_conf = [f for f, p in record['_provenance'].items()
+                        if p and p.get('ocr_confidence') is not None and p['ocr_confidence'] < cfg.min_cell_confidence]
+            record['_review_reasons'] = ([f'Missing critical fields: {", ".join(sorted(missing))}'] if missing else []) + ([f'Low OCR confidence: {", ".join(low_conf)}'] if low_conf else [])
             if record['_review_reasons']:
-                review.append(f'{kind} page {table.get("Page",1)} row {r}: {"; ".join(record["_review_reasons"])}')
+                source = record['_source']
+                review.append(f'{kind} page {source["page"]} row {source["row"]}: {"; ".join(record["_review_reasons"])}')
     return result, table_meta, review

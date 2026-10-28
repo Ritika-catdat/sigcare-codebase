@@ -7,6 +7,12 @@ def _value(value, provenance):
             'provenance': provenance}
 
 
+def _is_label(text):
+    """'Cell:' or 'Date of birth' on its own is the next field's label, never a value."""
+    label, _, rest = text.partition(':')
+    return not rest.strip() and any(match_score(label, aliases) >= .9 for aliases in PATIENT.values())
+
+
 def extract_patient(doc):
     output = {k: _value(None, None) for k in PATIENT}
     candidates = []
@@ -40,11 +46,11 @@ def extract_patient(doc):
                 if value.strip():
                     candidates.append((label, value, doc.provenance(cell.block_ids, cell.word_ids, cell.page), 3))
             below = grid.get((r + 1, c))
-            if below and below.text and any(match_score(cell.text, aliases) >= .9 for aliases in PATIENT.values()):
+            if below and below.text and not _is_label(below.text) and any(match_score(cell.text, aliases) >= .9 for aliases in PATIENT.values()):
                 candidates.append((cell.text, below.text, doc.provenance(below.block_ids, below.word_ids, below.page), 1))
     for field, aliases in PATIENT.items():
         ranked = sorted(((match_score(key, aliases), priority, value, prov)
-                         for key, value, prov, priority in candidates if value.strip()),
+                         for key, value, prov, priority in candidates if value.strip() and not _is_label(value)),
                         key=lambda x: (x[0], x[1]), reverse=True)
         if ranked and ranked[0][0] >= 0.76:
             output[field] = _value(ranked[0][2], ranked[0][3])
@@ -53,7 +59,8 @@ def extract_patient(doc):
     # "Landing / Cell" value already identified above.
     def best(label):
         ranked = sorted(((match_score(key, [label]), value, prov)
-                         for key, value, prov, priority in candidates if value.strip()), key=lambda x: x[0], reverse=True)
+                         for key, value, prov, priority in candidates if value.strip() and not _is_label(value)),
+                        key=lambda x: x[0], reverse=True)
         return (ranked[0][1], ranked[0][2]) if ranked and ranked[0][0] >= .88 else (None, None)
     landing, landing_prov = best('landing')
     cell, cell_prov = best('cell')
