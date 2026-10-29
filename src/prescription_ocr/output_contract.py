@@ -53,6 +53,27 @@ def transform_date(value):
     return ''
 
 
+# UK postcode, allowing OCR reading 0 as O in the inward part ("BN18 OBX").
+POSTCODE = re.compile(r'\b[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9O][A-Z]{2}\b', re.IGNORECASE)
+# A phone/reference number after a separator: "/ 01293 566549", "\ Tel: +44 (0)1293 566549".
+TRAILING_NUMBER = re.compile(
+    r'\s*[/\|,;:\u2013\u2014-]+\s*(?:(?:tel|telephone|phone|fax|t)\.?\s*:?\s*)?[+()\d][+()\d\s.-]*$',
+    re.IGNORECASE)
+
+
+def clean_address(address):
+    """Keep the address up to the postcode; drop a phone or long number after it."""
+    text = ' '.join(_str(address).split())
+    matches = list(POSTCODE.finditer(text))
+    if matches:
+        return text[:matches[-1].end()].strip()
+    # No recognisable postcode: remove a trailing number of 6+ digits after a separator.
+    match = TRAILING_NUMBER.search(text)
+    if match and sum(ch.isdigit() for ch in match.group()) >= 6:
+        text = text[:match.start()]
+    return text.strip(' ,/\|;:-')
+
+
 def split_address(site_name, address):
     """Site name is line 1. In the address, after the last comma is the postcode, between the
     last two commas the county, between the third- and second-last the city, up to the first
@@ -204,7 +225,7 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
     prescription_location = _str(source.get('prescription_location')) or f"s3://{source['bucket']}/{source['key']}"
     provider = internal.get('provider') or {}
     site_name = _str((provider.get('name') or {}).get('value'))
-    address = _str((provider.get('address') or {}).get('value'))
+    address = clean_address((provider.get('address') or {}).get('value'))
     return {
         'site_name': site_name,
         'address': address,

@@ -175,3 +175,17 @@ def test_site_name_and_address_stop_before_telephone():
     provider = extract_provider(Document({'Blocks': blocks}))
     assert provider['name']['value'] == 'Gatwick Immigration Removal Centre'
     assert provider['address']['value'] == 'Perimeter Road South, London Gatwick Airport, Gatwick, W Sussex, RH6 0PQ'
+
+
+def test_phone_or_number_after_the_postcode_is_removed_from_the_address():
+    from prescription_ocr.output_contract import clean_address
+    base = 'Perimeter Road South, London Gatwick Airport, Gatwick, W Sussex, RH6 0PQ'
+    for tail in (' / 01293 566549', ' \ 01293566549', ' | Tel: 01293 566549', ', +44 (0)1293 566549',
+                 ' - 0129356654912345', ''):
+        assert clean_address(base + tail) == base
+    assert clean_address('Ford Road, Ford, Arundel, W Sussex, BN18 OBX/01903 663000') == \
+        'Ford Road, Ford, Arundel, W Sussex, BN18 OBX'
+    # No recognisable postcode: a long trailing number after a separator is still dropped.
+    assert clean_address('1 High Street, Springfield / 0123456789') == '1 High Street, Springfield'
+    # Short numbers that are part of the address stay.
+    assert clean_address('Unit 5, 12 High Street') == 'Unit 5, 12 High Street'
