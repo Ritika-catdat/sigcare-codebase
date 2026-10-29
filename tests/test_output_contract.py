@@ -10,7 +10,9 @@ def test_exact_output_schema_and_confidences():
     internal = extract(response, {'prescription_id':'some-id'}, Config(min_table_header_score=.1))
     result = build_output(internal, Document(response), internal['extraction_metadata']['handwriting'],
                           {'prescription_id':'some-id','bucket':'b','key':'preprocessed/RX001.pdf'}, 'b', 'extracted/RX001.json')
-    assert list(result) == ['patient_name','date_of_birth','age','prisoner_number','wing','Landing','cell',
+    assert list(result) == ['site_name','address','address_line_1','address_line_2','address_line_3','city','postcode',
+                           'patient_name','salutation','first_name','middle_name','last_name',
+                           'date_of_birth','date_of_birth_transformed','age','prisoner_number','wing','Landing','cell',
                            'identification_ocr_confidence','in_possession','in_possession_record_count',
                            'not_in_possession','not_in_possession_record_count','allergy','allergy_record_count',
                            'hand_written_notes_present','hand_written_notes','notes_records_count',
@@ -123,3 +125,47 @@ def test_build_output_flags_low_record_confidence():
     out = build_output(internal, Document(response), internal['extraction_metadata']['handwriting'], source, 'b', 'p.json')
     assert out['flag_for_review']
     assert any('in_possession record 1: OCR confidence below 0.9' in r for r in out['review_reason'])
+
+
+def test_patient_name_is_split_in_both_formats():
+    from prescription_ocr.output_contract import split_name
+    assert split_name('Mr Mustopha Salawudeen Adigun') == {
+        'salutation': 'Mr', 'first_name': 'Mustopha', 'middle_name': 'Salawudeen', 'last_name': 'Adigun'}
+    assert split_name('Adigun, Mr Mustopha Salawudeen') == {
+        'salutation': 'Mr', 'first_name': 'Mustopha', 'middle_name': 'Salawudeen', 'last_name': 'Adigun'}
+    assert split_name('Lebghile, Boudjamaa') == {
+        'salutation': '', 'first_name': 'Boudjamaa', 'middle_name': '', 'last_name': 'Lebghile'}
+    assert split_name("Mrs. Mary-Jane J. O'Neil Smith")['middle_name'] == "J. O'Neil"
+    assert split_name('John Smith') == {'salutation': '', 'first_name': 'John', 'middle_name': '', 'last_name': 'Smith'}
+    assert split_name('') == {'salutation': '', 'first_name': '', 'middle_name': '', 'last_name': ''}
+
+
+def test_date_of_birth_is_transformed_to_iso():
+    from prescription_ocr.output_contract import transform_date
+    assert transform_date('26 Mar 1995') == '1995-03-26'
+    assert transform_date('26/03/1995') == '1995-03-26'
+    assert transform_date('1st Sept 1995') == '1995-09-01'
+    assert transform_date('not a date') == ''
+
+
+def test_address_is_split_by_commas():
+    from prescription_ocr.output_contract import split_address
+    assert split_address('Gatwick Immigration Removal Centre',
+                         'Perimeter Road South, London Gatwick Airport, Gatwick, W Sussex, RH6 0PQ') == {
+        'address_line_1': 'Gatwick Immigration Removal Centre', 'address_line_2': 'Perimeter Road South',
+        'address_line_3': 'London Gatwick Airport, Gatwick', 'city': 'W Sussex', 'postcode': 'RH6 0PQ'}
+    assert split_address('HMP X', 'Romsey Road, Winchester, SO22 5DF')['address_line_3'] == ''
+
+
+def test_site_name_and_address_stop_before_telephone():
+    from prescription_ocr.patient_provider_extractor import extract_provider
+    from test_prescription_extraction import _line
+    blocks = []
+    _line(blocks, 'l1', 'Printed by David Antwi-Boasiako', .02)
+    _line(blocks, 'l2', 'Gatwick Immigration Removal Centre', .08)
+    _line(blocks, 'l3', 'Perimeter Road South, London Gatwick Airport,', .12)
+    _line(blocks, 'l4', 'Gatwick, W Sussex, RH6 0PQ', .14)
+    _line(blocks, 'l5', 'Telephone: 01293 566549', .16)
+    provider = extract_provider(Document({'Blocks': blocks}))
+    assert provider['name']['value'] == 'Gatwick Immigration Removal Centre'
+    assert provider['address']['value'] == 'Perimeter Road South, London Gatwick Airport, Gatwick, W Sussex, RH6 0PQ'

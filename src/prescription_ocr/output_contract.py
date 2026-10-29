@@ -1,5 +1,6 @@
 """Exact downstream prescription JSON contract, separate from audit-rich extraction."""
 import re
+from datetime import datetime
 from pathlib import PurePosixPath
 
 IN_FIELDS = ('drug_name','dose','script_notes','start_date','days_duration','quantity','medication_type','possession_quantity','possession_interval','medication_notes','prescriber_name','prescriber')
@@ -9,6 +10,63 @@ ALLERGY_FIELDS = ('start_date','end_date','allergy_or_sensitivity')
 
 def _str(value):
     return '' if value is None else str(value)
+
+
+SALUTATIONS = {'mr', 'mrs', 'ms', 'miss', 'mx', 'master', 'dr', 'prof', 'professor',
+               'sir', 'dame', 'lady', 'lord', 'rev', 'revd', 'fr', 'sr'}
+DATE_FORMATS = ('%d %b %Y', '%d %B %Y', '%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%Y-%m-%d',
+                '%d-%b-%Y', '%d %b %y', '%d/%m/%y', '%d-%m-%y')
+
+
+def split_name(name):
+    """Salutation, first, middle and last name from "Mr First Middle Last" or "Last, Mr First Middle"."""
+    def is_salutation(word):
+        return word.rstrip('.').casefold() in SALUTATIONS
+
+    out = {'salutation': '', 'first_name': '', 'middle_name': '', 'last_name': ''}
+    name = ' '.join(_str(name).split())
+    if ',' in name:
+        last, rest = name.split(',', 1)
+        out['last_name'] = last.strip()
+        words = rest.split()
+    else:
+        words = name.split()
+        if len(words) > 1 and not (len(words) == 2 and is_salutation(words[0])):
+            out['last_name'] = words.pop()
+    if words and is_salutation(words[0]):
+        out['salutation'] = words.pop(0)
+    if words:
+        out['first_name'] = words.pop(0)
+    out['middle_name'] = ' '.join(words)
+    return out
+
+
+def transform_date(value):
+    """'26 Mar 1995' -> '1995-03-26' (UK day-first); '' when the text is not a date."""
+    text = re.sub(r'(\d)(st|nd|rd|th)\b', r'\1', _str(value).strip(), flags=re.IGNORECASE)
+    text = re.sub(r'\bsept\b', 'Sep', re.sub(r'\s+', ' ', text), flags=re.IGNORECASE).replace(',', '')
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return ''
+
+
+def split_address(site_name, address):
+    """Site name is line 1; in the address the text after the last comma is the postcode,
+    between the last two commas the city, up to the first comma line 2, and the rest line 3."""
+    parts = [p.strip() for p in _str(address).split(',') if p.strip()]
+    out = {'address_line_1': _str(site_name), 'address_line_2': '', 'address_line_3': '',
+           'city': '', 'postcode': ''}
+    if len(parts) >= 2:
+        out['postcode'] = parts.pop()
+    if len(parts) >= 2:
+        out['city'] = parts.pop()
+    if parts:
+        out['address_line_2'] = parts.pop(0)
+    out['address_line_3'] = ', '.join(parts)
+    return out
 
 
 def _avg(values):
@@ -144,9 +202,17 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
     # TODO (preprocessing integration): supply the S3 URI of the SPLIT PDF
     # actually being OCR-extracted. By default the input S3 object is that file.
     prescription_location = _str(source.get('prescription_location')) or f"s3://{source['bucket']}/{source['key']}"
+    provider = internal.get('provider') or {}
+    site_name = _str((provider.get('name') or {}).get('value'))
+    address = _str((provider.get('address') or {}).get('value'))
     return {
+        'site_name': site_name,
+        'address': address,
+        **split_address(site_name, address),
         'patient_name': values['name'],
+        **split_name(values['name']),
         'date_of_birth': values['date_of_birth'],
+        'date_of_birth_transformed': transform_date(values['date_of_birth']),
         'age': values['age'],
         'prisoner_number': values['prisoner_number'],
         'wing': values['wing'],
@@ -175,7 +241,8 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
 def failed_output(source, reasons):
     """Same contract for a prescription whose extraction could not run at all."""
     return {
-        'patient_name': '', 'date_of_birth': '', 'age': '', 'prisoner_number': '', 'wing': '',
+        'site_name': '', 'address': '', **split_address('', ''),
+        'patient_name': '', **split_name(''), 'date_of_birth': '', 'date_of_birth_transformed': '', 'age': '', 'prisoner_number': '', 'wing': '',
         'Landing': '', 'cell': '', 'identification_ocr_confidence': '',
         'in_possession': [], 'in_possession_record_count': 0,
         'not_in_possession': [], 'not_in_possession_record_count': 0,

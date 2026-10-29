@@ -87,10 +87,22 @@ def extract_provider(doc):
     candidate = [l for l in lines if not any(p in norm(l.get('Text', '')) for p in ignore)
                  and not stamp.match(norm(l.get('Text', '')))]
     name = candidate[0] if candidate else None
-    address_lines = candidate[1:4] if name else []
-    # Avoid interpreting a patient label as the hospital address.
-    address_lines = [l for l in address_lines if not any(match_score(l.get('Text','').split(':')[0], aliases) > .8 for aliases in PATIENT.values())]
+    address_lines = []
+    # The address is the lines under the site name, up to the contact details.
+    contact = re.compile(r'^(tel|telephone|phone|fax|email|e mail|web|www)\b')
+    for l in (candidate[1:4] if name else []):
+        text = l.get('Text', '')
+        if contact.match(norm(text)):
+            break
+        # Avoid interpreting a patient label as the hospital address.
+        if not any(match_score(text.split(':')[0], aliases) > .8 for aliases in PATIENT.values()):
+            address_lines.append(l)
+    # A wrapped address keeps its own commas; separate lines become comma-separated parts.
+    address = ''
+    for l in address_lines:
+        text = l.get('Text', '').strip()
+        address = f'{address} {text}' if address.endswith(',') or not address else f'{address}, {text}'
     return {'name': _value(name.get('Text') if name else None,
                             doc.provenance([name['Id']]) if name else None),
-            'address': _value(' '.join(l.get('Text', '') for l in address_lines),
+            'address': _value(address.strip(),
                                doc.provenance([l['Id'] for l in address_lines]) if address_lines else None)}
