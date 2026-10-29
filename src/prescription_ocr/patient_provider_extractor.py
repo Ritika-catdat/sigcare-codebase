@@ -7,8 +7,9 @@ def _value(value, provenance):
             'provenance': provenance}
 
 
-# Fields whose value always has a number in it ("36 y", "06 Jul 1990", "A4094AG").
-# A value without one ("y") is a piece of the real value, not the value.
+# Fields whose value normally has a number in it ("36 y", "06 Jul 1990", "A4094AG").
+# A value without one ("y") is often only part of the real value, so a value with a
+# number is preferred; a letters-only value is still kept when nothing better exists.
 NEEDS_DIGIT = {'age', 'date_of_birth', 'prisoner_number'}
 
 
@@ -86,17 +87,26 @@ def extract_patient(doc):
             if below and below.text and not _is_label(below.text) and any(match_score(cell.text, aliases) >= .9 for aliases in PATIENT.values()):
                 candidates.append((cell.text, below.text, doc.provenance(below.block_ids, below.word_ids, below.page), 1))
     for field, aliases in PATIENT.items():
-        ranked = sorted(((match_score(key, aliases), priority, value, prov)
+        # Values keep all their letters and digits ("36 y", "A4094AG"); a value that has a
+        # number is only preferred over one that does not.
+        ranked = sorted(((_valid(field, value), match_score(key, aliases), priority, value, prov)
                          for key, value, prov, priority in candidates
-                         if value.strip() and not _is_label(value) and _valid(field, value)),
-                        key=lambda x: (x[0], x[1]), reverse=True)
-        if ranked and ranked[0][0] >= 0.76:
-            output[field] = _value(ranked[0][2], ranked[0][3])
-        elif field in NEEDS_DIGIT:
-            # No complete value in any cell or form pair: read the row beside the label.
+                         if value.strip() and not _is_label(value)),
+                        key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        ranked = [r for r in ranked if r[1] >= 0.76]
+        best = ranked[0] if ranked else None
+        if best and not best[0]:
+            # Only a letters-only value was found ("y"): the number may have landed in
+            # another cell, so read the whole row beside the label ("36 y") when it has one.
             value, prov = _text_right_of_label(doc, aliases)
             if value and _valid(field, value):
-                output[field] = _value(value, prov)
+                best = (True, 1.0, 0, value, prov)
+        elif not best and field in NEEDS_DIGIT:
+            value, prov = _text_right_of_label(doc, aliases)
+            if value:
+                best = (_valid(field, value), 1.0, 0, value, prov)
+        if best:
+            output[field] = _value(best[3], best[4])
     # Landing and Cell are often separate labels in the patient header.
     # Combine them when both are present, without overwriting an explicit
     # "Landing / Cell" value already identified above.

@@ -288,3 +288,13 @@ def test_age_without_a_number_is_read_from_the_row_beside_the_label():
     assert patient['age']['value'] == '36 y'
     assert patient['date_of_birth']['value'] == '06 Jul 1990'
     assert patient['prisoner_number']['value'] == 'A4094AG'
+
+
+def test_letters_only_patient_values_are_kept_when_nothing_better_exists():
+    from prescription_ocr.patient_provider_extractor import extract_patient
+    blocks = []
+    _table(blocks, 'pt', 1, [['Patient name:', 'Mr A'], ['Patient age:', 'Unknown'],
+                             ['Prisoner number:', 'Not recorded']], top=.1)
+    patient = extract_patient(Document({'Blocks': blocks}))
+    assert patient['age']['value'] == 'Unknown'
+    assert patient['prisoner_number']['value'] == 'Not recorded'
