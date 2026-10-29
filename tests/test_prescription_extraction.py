@@ -162,7 +162,7 @@ def test_signature_is_not_a_handwritten_note():
     _line(blocks, 'sig2', 'Qi', .67, left=.2, hand=True)              # scrawl above "Signed:"
     doc = Document({'Blocks': blocks})
     result = detect_handwriting(doc, [], Config())
-    assert result['top_handwriting_word_ids'] == []
+    assert result['note_word_ids'] == []
     assert result['handwritten_notes'] is False
     assert set(result['signature_word_ids']) == {'sigw0', 'sigw1', 'sig2w0'}
 
@@ -195,7 +195,7 @@ def test_signature_read_as_a_single_letter_is_not_a_note():
     _line(blocks, 'sig', 'a', .12, left=.7, hand=True)   # signature showing through, no label read
     doc = Document({'Blocks': blocks})
     result = detect_handwriting(doc, [], Config())
-    assert result['top_handwriting_word_ids'] == []
+    assert result['note_word_ids'] == []
     assert _handwritten_notes(doc, result) == []
 
 
@@ -216,3 +216,30 @@ def test_unrecognised_table_with_a_drug_column_is_still_flagged():
     _table(blocks, 'ta', 1, [['Drug name', 'Strength'], ['Laxido', '1 sachet']])
     result = extract({'Blocks': blocks, 'Pages': 1}, {'prescription_id': 'odd'}, Config(min_table_header_score=.95))
     assert any('Unclassified table' in r for r in result['extraction_metadata']['review_reasons'])
+
+
+def test_handwritten_note_beside_the_signature_is_captured():
+    from prescription_ocr.handwriting_detector import detect_handwriting
+    from prescription_ocr.output_contract import _handwritten_notes
+    blocks = []
+    _line(blocks, 'printed', 'Printed by Mrs Mary-Jayne Bosley', .02)
+    _line(blocks, 'label', 'Signed: ....................', .80)
+    _line(blocks, 'sig', 'M', .78, left=.25, hand=True)                          # signature scrawl
+    _line(blocks, 'n1', 'This is not a duplicate', .76, left=.55, hand=True)    # note at the bottom
+    _line(blocks, 'n2', 'Please dispense 7 days I.P.', .80, left=.55, hand=True)
+    _line(blocks, 'n3', 'But not blister packs. Thank you.', .84, left=.55, hand=True)
+    doc = Document({'Blocks': blocks})
+    result = detect_handwriting(doc, [], Config())
+    assert result['handwritten_notes'] is True
+    assert 'sigw0' in result['signature_word_ids']
+    assert [n['note'] for n in _handwritten_notes(doc, result)] == [
+        'This is not a duplicate', 'Please dispense 7 days I.P.', 'But not blister packs. Thank you.']
+
+
+def test_handwriting_inside_a_table_is_not_a_note():
+    from prescription_ocr.handwriting_detector import detect_handwriting
+    blocks = []
+    _line(blocks, 'strike', 'struck through', .45, hand=True)
+    blocks.append(block('TABLE', 't1', Geometry={'BoundingBox': {'Top': .4, 'Left': 0, 'Width': 1, 'Height': .2}}))
+    result = detect_handwriting(Document({'Blocks': blocks}), [], Config())
+    assert result['note_word_ids'] == []

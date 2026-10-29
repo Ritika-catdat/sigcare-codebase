@@ -54,15 +54,15 @@ def transform_date(value):
 
 
 def split_address(site_name, address):
-    """Site name is line 1; in the address the text after the last comma is the postcode,
-    between the last two commas the city, up to the first comma line 2, and the rest line 3."""
+    """Site name is line 1. In the address, after the last comma is the postcode, between the
+    last two commas the county, between the third- and second-last the city, up to the first
+    comma line 2, and whatever is left line 3."""
     parts = [p.strip() for p in _str(address).split(',') if p.strip()]
     out = {'address_line_1': _str(site_name), 'address_line_2': '', 'address_line_3': '',
-           'city': '', 'postcode': ''}
-    if len(parts) >= 2:
-        out['postcode'] = parts.pop()
-    if len(parts) >= 2:
-        out['city'] = parts.pop()
+           'city': '', 'county': '', 'postcode': ''}
+    for field in ('postcode', 'county', 'city'):
+        if len(parts) >= 2:
+            out[field] = parts.pop()
     if parts:
         out['address_line_2'] = parts.pop(0)
     out['address_line_3'] = ', '.join(parts)
@@ -112,7 +112,7 @@ def _record(row, fields):
 
 
 def _handwritten_notes(doc, handwriting):
-    ids = set(handwriting.get('top_handwriting_word_ids', []))
+    ids = set(handwriting.get('note_word_ids', []))
     if not ids:
         return []
     # Group handwritten words by the Textract LINE parent; do not fragment notes into words.

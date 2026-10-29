@@ -7,6 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import fitz
+import numpy as np
 import pytesseract
 
 from .integrity import page_image
@@ -31,6 +32,28 @@ OCR_WORKERS = max(1, int(os.getenv("SIGCARE_OCR_WORKERS", "3")))
 # A normal page takes a few seconds; a page that takes longer than this is
 # recorded as an OCR error (manual review) instead of stalling the whole file.
 OCR_TIMEOUT_SECONDS = int(os.getenv("SIGCARE_OCR_TIMEOUT_SECONDS", "90"))
+
+
+# A blank page (or the empty back of a sheet) has almost no dark pixels and no readable
+# words. Both must hold, so a page with only a short handwritten note is kept.
+BLANK_INK_RATIO = float(os.getenv("SIGCARE_BLANK_INK_RATIO", "0.01"))
+BLANK_MAX_WORDS = 3
+# Scanner edges and punch holes sit in the outer margin, so it is not counted as ink.
+BLANK_MARGIN = 0.04
+
+
+def ink_ratio(image):
+    """Fraction of dark pixels inside the page margins."""
+    gray = np.asarray(image.convert("L").reduce(4))
+    h, w = gray.shape
+    mh, mw = int(h * BLANK_MARGIN), int(w * BLANK_MARGIN)
+    inner = gray[mh:h - mh, mw:w - mw]
+    return float((inner < 128).mean()) if inner.size else 0.0
+
+
+def is_blank(text, ink):
+    words = re.findall(r"[A-Za-z]{3,}", text or "")
+    return ink < BLANK_INK_RATIO and len(words) < BLANK_MAX_WORDS
 
 
 def ocr_image(image):
@@ -104,7 +127,7 @@ def detect_frontsheets(input_pdf, output_json, dpi=250):
 
     results = []
 
-    def collect(index, future):
+    def collect(index, future, ink):
         try:
             text = future.result()
             results.append({
@@ -112,6 +135,8 @@ def detect_frontsheets(input_pdf, output_json, dpi=250):
                 "ocr_text": text,
                 "ocr_engine": "Tesseract",
                 **classify_frontsheet(text),
+                "ink_ratio": None if ink is None else round(ink, 5),
+                "likely_blank": ink is not None and is_blank(text, ink),
                 "error": None,
             })
         except Exception as exc:
@@ -122,6 +147,8 @@ def detect_frontsheets(input_pdf, output_json, dpi=250):
                 "likely_frontsheet": False,
                 "matched_indicators": [],
                 "manual_review_required": True,
+                "ink_ratio": None if ink is None else round(ink, 5),
+                "likely_blank": False,
                 "error": f"{type(exc).__name__}: {exc}",
             })
 
@@ -133,12 +160,15 @@ def detect_frontsheets(input_pdf, output_json, dpi=250):
         max_workers=OCR_WORKERS, thread_name_prefix="sigcare-ocr"
     ) as pool:
         for index, page in enumerate(document):
+            ink = None
             try:
-                future = pool.submit(ocr_image, page_image(page, dpi))
+                image = page_image(page, dpi)
+                ink = ink_ratio(image)
+                future = pool.submit(ocr_image, image)
             except Exception as exc:
                 future = Future()
                 future.set_exception(exc)
-            pending.append((index, future))
+            pending.append((index, future, ink))
             if len(pending) >= OCR_WORKERS * 2:
                 collect(*pending.popleft())
         while pending:

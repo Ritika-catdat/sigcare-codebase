@@ -134,3 +134,39 @@ def test_frontsheet_ocr_timeout_marks_page_for_review(tmp_path, monkeypatch):
     assert [r["source_page"] for r in results] == [1, 2, 3]
     assert results[1]["manual_review_required"] and "timeout" in results[1]["error"]
     assert results[2]["likely_frontsheet"] is True
+
+
+def test_blank_pages_are_removed_before_splitting(tmp_path, monkeypatch):
+    monkeypatch.setattr(api, "OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(processing, "extract_prescription_pdf",
+                        lambda pdf_path, prescription_number, job_id, original_pdf_location, prescription_location:
+                        {"flag_for_review": False, "review_reason": []})
+    job_id = "c" * 32
+    (tmp_path / job_id / "input").mkdir(parents=True)
+    pdf = tmp_path / job_id / "input" / "uploaded.pdf"
+    doc = fitz.open()
+    for body, footer in [("Patient name: A", "Page 1 of 1"), (None, None), ("Patient name: B", "Page 1 of 1")]:
+        page = doc.new_page()
+        if body:
+            # Enough printed text to count as a real page.
+            for i in range(25):
+                page.insert_text((72, 100 + i * 24), f"{body} Drug name Paracetamol tablets line {i}", fontsize=14)
+            page.insert_text((72, page.rect.height - 40), footer, fontsize=10)
+    doc.save(pdf)
+    doc.close()
+    status = processing.JobStatus(tmp_path / job_id, job_id, "test.pdf")
+
+    api._process_job(job_id, "test.pdf", 120, False, status)
+
+    result = json.loads((tmp_path / job_id / "result.json").read_text(encoding="utf-8"))
+    assert result["frontsheet_detection"]["blank_pages"] == [2]
+    assert result["frontsheet_detection"]["removed_pages"] == [2]
+    assert [r["source_pages"] for r in result["results"]] == [[1], [3]]
+
+
+def test_page_with_little_ink_but_readable_words_is_not_blank():
+    from sigcare_quality.frontsheet import is_blank
+    assert is_blank("", 0.0005) is True
+    assert is_blank("~ . ,", 0.001) is True                         # speckle / bleed-through noise
+    assert is_blank("Please dispense 7 days", 0.001) is False      # a short note on its own page
+    assert is_blank("", 0.05) is False                              # ink that OCR could not read

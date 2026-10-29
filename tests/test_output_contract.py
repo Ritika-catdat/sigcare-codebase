@@ -10,7 +10,7 @@ def test_exact_output_schema_and_confidences():
     internal = extract(response, {'prescription_id':'some-id'}, Config(min_table_header_score=.1))
     result = build_output(internal, Document(response), internal['extraction_metadata']['handwriting'],
                           {'prescription_id':'some-id','bucket':'b','key':'preprocessed/RX001.pdf'}, 'b', 'extracted/RX001.json')
-    assert list(result) == ['site_name','address','address_line_1','address_line_2','address_line_3','city','postcode',
+    assert list(result) == ['site_name','address','address_line_1','address_line_2','address_line_3','city','county','postcode',
                            'patient_name','salutation','first_name','middle_name','last_name',
                            'date_of_birth','date_of_birth_transformed','age','prisoner_number','wing','Landing','cell',
                            'identification_ocr_confidence','in_possession','in_possession_record_count',
@@ -42,7 +42,7 @@ def test_record_shapes_and_handwriting_notes():
         {'BlockType':'WORD','Id':'w2','Page':1,'Text':'review','Confidence':94,'TextType':'HANDWRITING'},
         {'BlockType':'LINE','Id':'l1','Page':1,'Relationships':[{'Type':'CHILD','Ids':['w1','w2']}]}]
     doc=Document({'Blocks':blocks})
-    assert _handwritten_notes(doc,{'top_handwriting_word_ids':['w1','w2']}) == [
+    assert _handwritten_notes(doc,{'note_word_ids':['w1','w2']}) == [
         {'note':'Please review','note_ocr_confidence':89}]
 
 
@@ -153,8 +153,14 @@ def test_address_is_split_by_commas():
     assert split_address('Gatwick Immigration Removal Centre',
                          'Perimeter Road South, London Gatwick Airport, Gatwick, W Sussex, RH6 0PQ') == {
         'address_line_1': 'Gatwick Immigration Removal Centre', 'address_line_2': 'Perimeter Road South',
-        'address_line_3': 'London Gatwick Airport, Gatwick', 'city': 'W Sussex', 'postcode': 'RH6 0PQ'}
-    assert split_address('HMP X', 'Romsey Road, Winchester, SO22 5DF')['address_line_3'] == ''
+        'address_line_3': 'London Gatwick Airport', 'city': 'Gatwick', 'county': 'W Sussex', 'postcode': 'RH6 0PQ'}
+    assert split_address('HMP Ford', 'Ford Road, Ford, Arundel, W Sussex, BN18 OBX') == {
+        'address_line_1': 'HMP Ford', 'address_line_2': 'Ford Road', 'address_line_3': 'Ford',
+        'city': 'Arundel', 'county': 'W Sussex', 'postcode': 'BN18 OBX'}
+    # Fewer parts: the postcode, county and city are taken first, line 2 keeps the first part.
+    assert split_address('HMP X', 'Romsey Road, Winchester, SO22 5DF') == {
+        'address_line_1': 'HMP X', 'address_line_2': 'Romsey Road', 'address_line_3': '',
+        'city': '', 'county': 'Winchester', 'postcode': 'SO22 5DF'}
 
 
 def test_site_name_and_address_stop_before_telephone():

@@ -32,7 +32,7 @@ pages are split into prescriptions, each prescription gets a quality check and
 cleaned images, then AWS Textract (async, via the staging bucket) produces
 `processed/<prescription>/prescription.json` in the downstream contract from
 `prescription_ocr/output_contract.py` (site name and address split into
-`address_line_1..3`/`city`/`postcode`, flat patient fields with the name split
+`address_line_1..3`/`city`/`county`/`postcode`, flat patient fields with the name split
 into `salutation`/`first_name`/`middle_name`/`last_name` and
 `date_of_birth_transformed` as yyyy-mm-dd, `in_possession`,
 `not_in_possession`, `allergy`, handwritten notes, `flag_for_review`,

@@ -26,7 +26,7 @@ def extract(response, source, cfg=None):
     for kind, rows in data.items():
         data[kind] = [r for r in rows if r['_source']['table_id'] not in ignored_ids]
     if handwriting['handwritten_notes']:
-        review.append('Handwriting in top margin/header outside detected tables')
+        review.append('Handwritten notes present')
     if ignored_ids:
         review.append('Fully handwritten table(s) excluded: ' + ', '.join(sorted(ignored_ids)))
     if response.get('Warnings'):

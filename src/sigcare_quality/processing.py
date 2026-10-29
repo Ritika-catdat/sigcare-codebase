@@ -344,22 +344,28 @@ def process_document(
         for item in frontsheet_results
         if item.get("likely_frontsheet") is True
     ]
+    blank_pages = [
+        item["source_page"]
+        for item in frontsheet_results
+        if item.get("likely_blank") is True and item.get("likely_frontsheet") is not True
+    ]
+    removed_pages = sorted(set(likely_frontsheet_pages) | set(blank_pages))
     manual_review_pages = [
         item["source_page"]
         for item in frontsheet_results
         if item.get("manual_review_required") is True
     ]
     LOG.info(
-        "[%s] front-sheet detection: %d pages, front sheets %s (%.1fs)",
-        job_id, len(frontsheet_results), likely_frontsheet_pages,
+        "[%s] front-sheet detection: %d pages, front sheets %s, blank pages %s (%.1fs)",
+        job_id, len(frontsheet_results), likely_frontsheet_pages, blank_pages,
         time.monotonic() - stage_start,
     )
 
-    # Stage 2: remove front sheets, then split the remaining pages.
+    # Stage 2: remove front sheets and blank pages, then split the remaining pages.
     status.update(stage="SPLITTING")
     stage_start = time.monotonic()
     prescriptions_pdf = split_dir.parent / "frontsheets_removed.pdf"
-    kept_pages = remove_pages(input_pdf, prescriptions_pdf, set(likely_frontsheet_pages))
+    kept_pages = remove_pages(input_pdf, prescriptions_pdf, set(removed_pages))
     ocr_text = {item["source_page"]: item.get("ocr_text") or "" for item in frontsheet_results}
 
     if kept_pages:
@@ -373,7 +379,7 @@ def process_document(
     else:
         split_dir.mkdir(parents=True, exist_ok=True)
         (split_dir / "split_report.txt").write_text(
-            "All pages were detected as front sheets; nothing to split.", encoding="utf-8"
+            "All pages were detected as front sheets or blank; nothing to split.", encoding="utf-8"
         )
         split_files, split_pages = [], []
     LOG.info(
@@ -466,9 +472,10 @@ def process_document(
         "frontsheet_detection": {
             "pages_scanned": len(frontsheet_results),
             "likely_frontsheet_pages": likely_frontsheet_pages,
+            "blank_pages": blank_pages,
             "manual_review_pages": manual_review_pages,
-            "removal_performed": bool(likely_frontsheet_pages),
-            "removed_pages": likely_frontsheet_pages,
+            "removal_performed": bool(removed_pages),
+            "removed_pages": removed_pages,
         },
         "results": results,
         "note": (
