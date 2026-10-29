@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from collections import defaultdict
 
@@ -112,7 +113,85 @@ class Document:
                                     bbox=self.bbox(source), word_ids=[w['Id'] for w in words],
                                     row=row, col=col,
                                     is_header='COLUMN_HEADER' in b.get('EntityTypes', []))
+        self._split_overflowing_words(grid, {k for k in grid if k in merges})
         return grid
+
+    # Characters a column ruling line is read as when OCR runs a word across it.
+    BORDER_CHARS = '|!iIl1'
+
+    def _split_overflowing_words(self, grid, merged_positions):
+        """Give back to the next column the part of a word that runs over a cell's right edge.
+
+        In tightly packed tables OCR can read across a ruling line as one word, e.g.
+        "tablet|times" -> "tabletitimes" in the Dose cell while "times" belongs to Script
+        Notes. The word is cut where it crosses the edge (at the misread line character
+        when there is one) and the overflow is inserted into the next cell in reading order.
+        """
+        pieces = {}
+        for key, cell in grid.items():
+            if key not in merged_positions:
+                pieces[key] = [(self.bbox(self.index[i]), self.index[i].get('Text', ''))
+                               for i in cell.word_ids if i in self.index]
+        changed = set()
+        for (row, col), cell in sorted(grid.items()):
+            nxt = (row, col + 1)
+            if (row, col) not in pieces or nxt not in pieces or not cell.bbox:
+                continue
+            edge = cell.bbox.get('Left', 0) + cell.bbox.get('Width', 0)
+            kept = []
+            for box, text in pieces[(row, col)]:
+                left, width = box.get('Left', 0), box.get('Width', 0)
+                over = left + width - edge
+                if width <= 0 or len(text) < 4 or left >= edge or over < max(.004, .2 * width):
+                    kept.append((box, text))
+                    continue
+                head, tail = self._cut(text, round(len(text) * (edge - left) / width))
+                if head:
+                    kept.append((box, head))
+                if tail:
+                    tail_box = {**box, 'Left': edge, 'Width': over}
+                    self._insert_in_reading_order(pieces[nxt], (tail_box, tail))
+                    changed.add(nxt)
+                changed.add((row, col))
+            pieces[(row, col)] = kept
+        for key in changed:
+            grid[key].text = ' '.join(t for _, t in pieces[key]).strip()
+
+    def _vocabulary(self):
+        if not hasattr(self, '_vocab'):
+            self._vocab = {re.sub(r'[^a-z0-9]', '', w.get('Text', '').casefold())
+                           for w in self.blocks if w.get('BlockType') == 'WORD'}
+        return self._vocab
+
+    def _cut(self, text, at):
+        """Split near the estimated edge position. Prefer a cut that drops a misread ruling
+        line and leaves pieces that occur as words elsewhere in the same document."""
+        vocab = self._vocabulary()
+        def known(piece):
+            key = re.sub(r'[^a-z0-9]', '', piece.casefold())
+            return len(key) >= 2 and key in vocab
+        best = None
+        for i in range(max(1, at - 3), min(len(text) - 1, at + 3) + 1):
+            options = [(text[:i], text[i:], 0)]
+            if text[i] in self.BORDER_CHARS and i < len(text) - 1:
+                options.append((text[:i], text[i + 1:], 1))
+            for head, tail, border in options:
+                score = 10 * (known(head) + known(tail)) + border - abs(i - at)
+                if best is None or score > best[0]:
+                    best = (score, head, tail)
+        return (best[1], best[2]) if best else (text[:at], text[at:])
+
+    @staticmethod
+    def _insert_in_reading_order(pieces, piece):
+        box = piece[0]
+        middle = box.get('Top', 0) + box.get('Height', 0) / 2
+        for i, (other, _) in enumerate(pieces):
+            other_middle = other.get('Top', 0) + other.get('Height', 0) / 2
+            same_line = abs(other_middle - middle) < max(box.get('Height', 0), other.get('Height', 0)) / 2
+            if (same_line and other.get('Left', 0) > box.get('Left', 0)) or (not same_line and other_middle > middle):
+                pieces.insert(i, piece)
+                return
+        pieces.append(piece)
 
     def adjacent_lines(self, table, before=0.1):
         tb = self.bbox(table)

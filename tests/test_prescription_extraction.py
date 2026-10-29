@@ -243,3 +243,48 @@ def test_handwriting_inside_a_table_is_not_a_note():
     blocks.append(block('TABLE', 't1', Geometry={'BoundingBox': {'Top': .4, 'Left': 0, 'Width': 1, 'Height': .2}}))
     result = detect_handwriting(Document({'Blocks': blocks}), [], Config())
     assert result['note_word_ids'] == []
+
+
+def _word(blocks, ident, text, left, top, width, height=.015, page=1):
+    blocks.append(block('WORD', ident, Page=page, Text=text, TextType='PRINTED',
+                        Geometry={'BoundingBox': {'Left': left, 'Top': top, 'Width': width, 'Height': height}}))
+    return ident
+
+
+def test_word_run_across_a_column_line_is_split_between_the_cells():
+    blocks = []
+    def cell(ident, r, c, left, width, ids, top=.30, height=.10):
+        blocks.append(block('CELL', ident, RowIndex=r, ColumnIndex=c, Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                            Geometry={'BoundingBox': {'Left': left, 'Top': top, 'Width': width, 'Height': height}}))
+        return ident
+    # Dose column 0.10-0.20, Script Notes 0.20-0.30. Line 1 at top .31, line 2 at .33.
+    ids = [cell('h1', 1, 1, .10, .10, [_word(blocks, 'hw1', 'Dose', .11, .21, .05)], top=.20),
+           cell('h2', 1, 2, .20, .10, [_word(blocks, 'hw2', 'Script', .21, .21, .05),
+                                       _word(blocks, 'hw3', 'Notes', .21, .23, .05)], top=.20),
+           cell('d', 2, 1, .10, .10, [_word(blocks, 'w1', '1', .11, .31, .01),
+                                      _word(blocks, 'w2', 'tabletitimes', .11, .33, .14)]),
+           cell('s', 2, 2, .20, .10, [_word(blocks, 'w3', '1', .21, .31, .01),
+                                      _word(blocks, 'w4', 'tablet,', .225, .31, .04),
+                                      _word(blocks, 'w5', '1', .27, .31, .01),
+                                      _word(blocks, 'w6', 'per', .26, .33, .02),
+                                      _word(blocks, 'w7', '1', .21, .35, .01),
+                                      _word(blocks, 'w8', 'day(s)', .225, .35, .04)])]
+    blocks.append(block('TABLE', 't1', Relationships=[{'Type': 'CHILD', 'Ids': ids}]))
+    grid = Document({'Blocks': blocks}).table_grid(blocks[-1])
+    assert grid[(2, 1)].text == '1 tablet'
+    assert grid[(2, 2)].text == '1 tablet, 1 times per 1 day(s)'
+
+
+def test_age_without_a_number_is_read_from_the_row_beside_the_label():
+    from prescription_ocr.patient_provider_extractor import extract_patient
+    blocks = []
+    # The table cell only has "y"; the full "36 y" sits on the row to the right of the label.
+    _table(blocks, 'pt', 1, [['Patient name:', 'Mr Jake Prempeh'], ['Date of birth:', '06 Jul 1990'],
+                             ['Patient age:', 'y'], ['Prisoner number:', 'A4094AG']], top=.1)
+    _line(blocks, 'age', 'Patient age:', .20, left=.05)                # label line, right edge .35
+    _word(blocks, 'a1', '36', .36, .20, .02)
+    _word(blocks, 'a2', 'y', .385, .20, .01)
+    patient = extract_patient(Document({'Blocks': blocks}))
+    assert patient['age']['value'] == '36 y'
+    assert patient['date_of_birth']['value'] == '06 Jul 1990'
+    assert patient['prisoner_number']['value'] == 'A4094AG'

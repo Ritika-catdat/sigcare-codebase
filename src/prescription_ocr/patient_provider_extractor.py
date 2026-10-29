@@ -7,6 +7,43 @@ def _value(value, provenance):
             'provenance': provenance}
 
 
+# Fields whose value always has a number in it ("36 y", "06 Jul 1990", "A4094AG").
+# A value without one ("y") is a piece of the real value, not the value.
+NEEDS_DIGIT = {'age', 'date_of_birth', 'prisoner_number'}
+
+
+def _valid(field, value):
+    return field not in NEEDS_DIGIT or any(ch.isdigit() for ch in value)
+
+
+def _text_right_of_label(doc, aliases):
+    """Words on the same row to the right of a printed label, e.g. "36 y" after "Patient age:".
+
+    Used when the table/form value is incomplete because OCR put part of it in another cell.
+    """
+    for line in doc.lines():
+        label = line.get('Text', '').split(':')[0]
+        if match_score(label, aliases) < .9:
+            continue
+        lb = doc.bbox(line)
+        top, height = lb.get('Top', 0), lb.get('Height', 0)
+        right = lb.get('Left', 0) + lb.get('Width', 0)
+        own = {w['Id'] for w in doc.child_words(line)}
+        words = []
+        for w in doc.blocks:
+            if w.get('BlockType') != 'WORD' or w['Id'] in own or w.get('Page', 1) != line.get('Page', 1):
+                continue
+            b = doc.bbox(w)
+            middle = b.get('Top', 0) + b.get('Height', 0) / 2
+            if top - height * .3 <= middle <= top + height * 1.3 and right - .01 <= b.get('Left', 0) <= right + .4:
+                words.append(w)
+        if words:
+            words.sort(key=lambda w: doc.bbox(w).get('Left', 0))
+            text = ' '.join(w.get('Text', '') for w in words).lstrip(':').strip()
+            return text, doc.provenance([w['Id'] for w in words])
+    return None, None
+
+
 def _is_label(text):
     """'Cell:' or 'Date of birth' on its own is the next field's label, never a value."""
     label, _, rest = text.partition(':')
@@ -50,10 +87,16 @@ def extract_patient(doc):
                 candidates.append((cell.text, below.text, doc.provenance(below.block_ids, below.word_ids, below.page), 1))
     for field, aliases in PATIENT.items():
         ranked = sorted(((match_score(key, aliases), priority, value, prov)
-                         for key, value, prov, priority in candidates if value.strip() and not _is_label(value)),
+                         for key, value, prov, priority in candidates
+                         if value.strip() and not _is_label(value) and _valid(field, value)),
                         key=lambda x: (x[0], x[1]), reverse=True)
         if ranked and ranked[0][0] >= 0.76:
             output[field] = _value(ranked[0][2], ranked[0][3])
+        elif field in NEEDS_DIGIT:
+            # No complete value in any cell or form pair: read the row beside the label.
+            value, prov = _text_right_of_label(doc, aliases)
+            if value and _valid(field, value):
+                output[field] = _value(value, prov)
     # Landing and Cell are often separate labels in the patient header.
     # Combine them when both are present, without overwriting an explicit
     # "Landing / Cell" value already identified above.
