@@ -29,6 +29,20 @@ def test_classify_frontsheet():
     assert classify_frontsheet("Patient name: Mr A\nDrug name Dose")["likely_frontsheet"] is False
 
 
+def test_delivery_list_cover_page_is_a_front_sheet():
+    delivery_list = ("AM\nSent On : 13/10/2026 Delivery on : 14/10/2026\n"
+                     "Patient’s Surname ID number Number of meds\nAdam A1486FM 1\nBlack A4360DA 2")
+    result = classify_frontsheet(delivery_list)
+    assert result["likely_frontsheet"] is True
+    assert {"sent_on", "delivery_on", "number_of_meds"} <= set(result["matched_indicators"])
+    # As OCR actually read it: the grey table header was lost.
+    ocr_read = "AM\n\nSent On : 13/10/2026\n\nDelivery on:\n\n14/10/2026\n\nte\n\n~Y\n\na\n\nNumber\n\nan"
+    assert classify_frontsheet(ocr_read)["likely_frontsheet"] is True
+    prescription = ("HMP Leicester\nPatient name: Mr Shamir Adam\nDate of birth: 30 Apr 1989\n"
+                    "Prisoner number: A1486FM\nIN Possession Prescriptions\nDrug name Dose Script Notes")
+    assert classify_frontsheet(prescription)["likely_frontsheet"] is False
+
+
 def test_remove_pages_and_split_keep_original_page_numbers(tmp_path):
     source = tmp_path / "in.pdf"
     _make_pdf(source, [
@@ -170,3 +184,6 @@ def test_page_with_little_ink_but_readable_words_is_not_blank():
     assert is_blank("~ . ,", 0.001) is True                         # speckle / bleed-through noise
     assert is_blank("Please dispense 7 days", 0.001) is False      # a short note on its own page
     assert is_blank("", 0.05) is False                              # ink that OCR could not read
+    # Scanned empty back page: no ink at all, but OCR reads the paper texture as words.
+    assert is_blank("of Bis on\n\nse\n\naT hee\n\nBete Bamie See ss", 0.0) is True
+    assert is_blank("Printed by Dr Naeema Choudhury Date: 12 Oct 2026", 0.00341) is False

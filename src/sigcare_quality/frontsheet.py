@@ -26,6 +26,14 @@ FRONTSHEET_PATTERNS = {
     ),
 }
 
+DELIVERY_LIST_PATTERNS = {
+    "sent_on": r"\bsent\s+on\b",
+    "delivery_on": r"\bdelivery\s+on\b",
+    "patient_surname": r"\bpatient\W{0,2}s?\s+surname\b",
+    "id_number": r"\bid\s+number\b",
+    "number_of_meds": r"\bnumber\s+of\s+meds?\b",
+}
+
 
 # Tesseract processes run in parallel, one page each (pair with OMP_THREAD_LIMIT=1).
 OCR_WORKERS = max(1, int(os.getenv("SIGCARE_OCR_WORKERS", "3")))
@@ -40,6 +48,9 @@ BLANK_INK_RATIO = float(os.getenv("SIGCARE_BLANK_INK_RATIO", "0.01"))
 BLANK_MAX_WORDS = 3
 # Scanner edges and punch holes sit in the outer margin, so it is not counted as ink.
 BLANK_MARGIN = 0.04
+# Below this there is no ink at all; Tesseract still "reads" the paper texture of an
+# empty scanned back page as junk words ("Bis", "hee"), so the word count is ignored.
+BLANK_NO_INK = 0.0005
 
 
 def ink_ratio(image):
@@ -52,6 +63,8 @@ def ink_ratio(image):
 
 
 def is_blank(text, ink):
+    if ink < BLANK_NO_INK:
+        return True
     words = re.findall(r"[A-Za-z]{3,}", text or "")
     return ink < BLANK_INK_RATIO and len(words) < BLANK_MAX_WORDS
 
@@ -105,11 +118,19 @@ def classify_frontsheet(text):
     heading_found = "sigma_front_sheet_heading" in matches
     supporting_count = len(matches) - int(heading_found)
 
+    # The other cover page in use: a delivery list ("AM / Sent On / Delivery on" over a
+    # "Patient's Surname | ID number | Number of meds" table). A prescription has none
+    # of these labels. OCR often misses the grey table header, so "Sent On" with
+    # "Delivery on" is enough on its own.
+    delivery_list = [name for name, pattern in DELIVERY_LIST_PATTERNS.items()
+                     if re.search(pattern, normalized)]
+    matches.extend(delivery_list)
+
     likely_frontsheet = (
         heading_found and supporting_count >= 1
     ) or (
         not heading_found and supporting_count >= 4
-    )
+    ) or len(delivery_list) >= 3 or {"sent_on", "delivery_on"} <= set(delivery_list)
 
     return {
         "likely_frontsheet": likely_frontsheet,
