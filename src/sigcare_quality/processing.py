@@ -23,6 +23,7 @@ import pytesseract
 from .pipeline import run_quality_pipeline
 from .frontsheet import detect_frontsheets, ocr_image
 from .integrity import page_image
+from .observability import emit_metric, emit_metrics, submit_with_context
 from .textract_integration import extract_prescription_pdf, prescription_source
 from prescription_ocr.output_contract import failed_output
 
@@ -280,7 +281,9 @@ def extract_one(
         status = "REVIEW_REQUIRED" if result.get("flag_for_review") else "EXTRACTED"
         return result, status, None
     except Exception as exc:
-        LOG.exception("Textract extraction failed for %s", split_file.name)
+        LOG.exception("Textract extraction failed for %s", split_file.name,
+                      extra={"prescription_number": number})
+        emit_metric("TextractFailures")
         error = f"{type(exc).__name__}: {exc}"
         source = prescription_source(split_file, number, job_id,
                                      original_pdf_location, prescription_location)
@@ -359,6 +362,8 @@ def process_document(
         "[%s] front-sheet detection: %d pages, front sheets %s, blank pages %s (%.1fs)",
         job_id, len(frontsheet_results), likely_frontsheet_pages, blank_pages,
         time.monotonic() - stage_start,
+        extra={"stage": "FRONTSHEET", "duration_s": round(time.monotonic() - stage_start, 1),
+               "pages": len(frontsheet_results)},
     )
 
     # Stage 2: remove front sheets and blank pages, then split the remaining pages.
@@ -385,6 +390,8 @@ def process_document(
     LOG.info(
         "[%s] split into %d prescriptions (%.1fs)",
         job_id, len(split_files), time.monotonic() - stage_start,
+        extra={"stage": "SPLITTING", "duration_s": round(time.monotonic() - stage_start, 1),
+               "prescriptions": len(split_files)},
     )
 
     # Stages 3 and 4 overlap: Textract only needs the split PDFs, so its jobs
@@ -398,8 +405,10 @@ def process_document(
         thread_name_prefix="sigcare-textract",
     ) as pool:
         futures = {
-            pool.submit(extract_one, split_file, number, job_id, original_pdf_location,
-                        artifact_location(relative(split_file))): number
+            # Keep the job's log context (job_id, source_key) in the Textract threads.
+            submit_with_context(pool, extract_one, split_file, number, job_id,
+                                original_pdf_location,
+                                artifact_location(relative(split_file))): number
             for number, split_file in enumerate(split_files, start=1)
         }
 
@@ -414,7 +423,9 @@ def process_document(
                 dpi=dpi,
                 create_cleanup=create_cleanup,
             ))
-        LOG.info("[%s] quality + cleanup done (%.1fs)", job_id, time.monotonic() - stage_start)
+        LOG.info("[%s] quality + cleanup done (%.1fs)", job_id, time.monotonic() - stage_start,
+                 extra={"stage": "QUALITY",
+                        "duration_s": round(time.monotonic() - stage_start, 1)})
 
         # Stage 4: collect the Textract results.
         done = sum(future.done() for future in futures)
@@ -424,7 +435,8 @@ def process_document(
             extractions[futures[future]] = future.result()
             status.update(progress=f"{len(extractions)}/{len(split_files)}")
     LOG.info("[%s] Textract extraction done (%.1fs since quality started)",
-             job_id, time.monotonic() - stage_start)
+             job_id, time.monotonic() - stage_start,
+             extra={"stage": "TEXTRACT", "duration_s": round(time.monotonic() - stage_start, 1)})
 
     results: list[dict[str, Any]] = []
     for number, split_file in enumerate(split_files, start=1):
@@ -485,5 +497,15 @@ def process_document(
     }
     write_json(job_dir / "result.json", response)
     status.update(status=overall_status, stage="DONE", progress=None)
-    LOG.info("[%s] finished %s in %.1fs", job_id, overall_status, time.monotonic() - started)
+    LOG.info("[%s] finished %s in %.1fs", job_id, overall_status, time.monotonic() - started,
+             extra={"stage": "DONE", "job_status": overall_status,
+                    "duration_s": response["processing_seconds"],
+                    "source_pages": source_page_count, "prescriptions": len(results)})
+    emit_metrics({
+        "PrescriptionsCreated": len(results),
+        "PrescriptionsReviewRequired": sum(
+            r["quality_status"] != "PASS" or r["extraction_status"] != "EXTRACTED"
+            for r in results),
+        "PagesProcessed": source_page_count,
+    })
     return response

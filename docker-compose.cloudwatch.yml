@@ -1,0 +1,35 @@
+# Ship container logs to CloudWatch Logs instead of local json-file logs.
+#
+# Turn on by adding this line to .env (Compose reads it automatically):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.cloudwatch.yml
+#
+# Needs, already set up by infra for staging:
+#   - log groups /sigcare/staging/api and /sigcare/staging/worker (eu-west-2)
+#   - logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams on the
+#     EC2 instance role. Docker itself (not the container) uses that role.
+#
+# `docker compose logs` keeps working: Docker caches recent logs locally.
+
+x-cloudwatch-options: &cloudwatch-options
+  awslogs-region: ${AWS_REGION:-eu-west-2}
+  awslogs-create-group: "false"
+  # One stream per container name, e.g. sigcare-api, so restarts append to it.
+  tag: "{{.Name}}"
+  # Never block the app on CloudWatch; up to 4 MB is buffered if it is slow.
+  mode: non-blocking
+  max-buffer-size: 4m
+
+services:
+  api:
+    logging:
+      driver: awslogs
+      options:
+        <<: *cloudwatch-options
+        awslogs-group: ${SIGCARE_LOG_GROUP_PREFIX:-/sigcare/staging}/api
+
+  worker:
+    logging:
+      driver: awslogs
+      options:
+        <<: *cloudwatch-options
+        awslogs-group: ${SIGCARE_LOG_GROUP_PREFIX:-/sigcare/staging}/worker

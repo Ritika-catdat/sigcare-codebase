@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SigCare monitoring: error-log metric filters, alarms emailed through SNS, and a
+  CloudWatch dashboard. The application publishes its own metrics to the
+  SigCare/<Environment> namespace (src/sigcare_quality/observability.py).
+
+# Deploy (eu-west-2), by someone allowed to create alarms, metric filters and dashboards:
+#   aws cloudformation deploy --region eu-west-2 \
+#     --stack-name sigcare-staging-monitoring \
+#     --template-file deploy/cloudwatch/monitoring.yaml \
+#     --parameter-overrides InstanceId=i-0219ffb4d669ddddd
+
+Parameters:
+  Environment:
+    Type: String
+    Default: Staging
+    Description: APP_ENV in title case; used in names and the metrics namespace.
+  LogGroupPrefix:
+    Type: String
+    Default: /sigcare/staging
+    Description: Existing log groups <prefix>/api and <prefix>/worker.
+  AlertTopicArn:
+    Type: String
+    Default: arn:aws:sns:eu-west-2:329286678954:sigcare-staging-alerts
+  InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Description: EC2 instance that runs the containers.
+  WorkerSilentMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: >-
+      Alarm when the worker sends no heartbeat for this many minutes. The heartbeat
+      is sent after each scan, so keep this above the time the largest PDF takes.
+
+Resources:
+  # ------------------------- Error log lines -------------------------
+  # Every JSON log line has "level" and "service"; count ERROR/CRITICAL per service.
+  ApiErrorLogFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "${LogGroupPrefix}/api"
+      FilterName: sigcare-error-logs
+      FilterPattern: '{ ($.level = "ERROR") || ($.level = "CRITICAL") }'
+      MetricTransformations:
+        - MetricNamespace: !Sub "SigCare/${Environment}"
+          MetricName: ErrorLogs
+          MetricValue: "1"
+          Unit: Count
+          Dimensions:
+            - Key: Service
+              Value: $.service
+
+  WorkerErrorLogFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub "${LogGroupPrefix}/worker"
+      FilterName: sigcare-error-logs
+      FilterPattern: '{ ($.level = "ERROR") || ($.level = "CRITICAL") }'
+      MetricTransformations:
+        - MetricNamespace: !Sub "SigCare/${Environment}"
+          MetricName: ErrorLogs
+          MetricValue: "1"
+          Unit: Count
+          Dimensions:
+            - Key: Service
+              Value: $.service
+
+  # ------------------------------ Alarms ------------------------------
+  WorkerDocumentFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-worker-document-failed"
+      AlarmDescription: >-
+        A PDF from S3 failed processing. It stays in input/ with
+        intermediary/<file>/manifest/status.json = FAILED. Find its job_id in the
+        worker logs, fix the cause, then delete that status.json to retry.
+      Namespace: !Sub "SigCare/${Environment}"
+      MetricName: DocumentsFailed
+      Dimensions: [{ Name: Service, Value: sigcare-worker }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  ApiDocumentFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-api-document-failed"
+      AlarmDescription: A PDF uploaded through the API failed processing. Check the api logs.
+      Namespace: !Sub "SigCare/${Environment}"
+      MetricName: DocumentsFailed
+      Dimensions: [{ Name: Service, Value: sigcare-api }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  ApiErrorLogsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-api-errors"
+      AlarmDescription: The API logged an ERROR. Search the api log group for level = "ERROR".
+      Namespace: !Sub "SigCare/${Environment}"
+      MetricName: ErrorLogs
+      Dimensions: [{ Name: Service, Value: sigcare-api }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  WorkerErrorLogsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-worker-errors"
+      AlarmDescription: The S3 worker logged an ERROR. Search the worker log group for level = "ERROR".
+      Namespace: !Sub "SigCare/${Environment}"
+      MetricName: ErrorLogs
+      Dimensions: [{ Name: Service, Value: sigcare-worker }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  WorkerHeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-worker-down"
+      AlarmDescription: >-
+        No heartbeat from the S3 worker: the container is down, stuck, or cannot
+        reach S3. On the VM run "docker compose ps" and "docker compose logs worker".
+      Namespace: !Sub "SigCare/${Environment}"
+      MetricName: Heartbeat
+      Dimensions: [{ Name: Service, Value: sigcare-worker }]
+      Statistic: SampleCount
+      Period: 60
+      EvaluationPeriods: !Ref WorkerSilentMinutes
+      DatapointsToAlarm: !Ref WorkerSilentMinutes
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # Missing data is exactly the failure this alarm looks for.
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopicArn]
+      OKActions: [!Ref AlertTopicArn]
+
+  CpuCreditsLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-cpu-credits-low"
+      AlarmDescription: >-
+        The t3 VM is running out of CPU credits, so OCR will slow down sharply.
+        Switch the instance to Unlimited credits or a non-burstable type.
+      Namespace: AWS/EC2
+      MetricName: CPUCreditBalance
+      Dimensions: [{ Name: InstanceId, Value: !Ref InstanceId }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
+  # ----------------------------- Dashboard -----------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "sigcare-${Environment}"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+                "title": "Documents (S3 worker)", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["${Ns}", "DocumentsProcessed", "Service", "sigcare-worker"],
+                  ["${Ns}", "DocumentsNeedingReview", "Service", "sigcare-worker"],
+                  ["${Ns}", "DocumentsFailed", "Service", "sigcare-worker"]
+                ]}},
+              {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+                "title": "Documents (API)", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["${Ns}", "DocumentsReceived", "Service", "sigcare-api"],
+                  ["${Ns}", "DocumentsProcessed", "Service", "sigcare-api"],
+                  ["${Ns}", "DocumentsFailed", "Service", "sigcare-api"]
+                ]}},
+              {"type": "metric", "x": 0, "y": 6, "width": 8, "height": 6, "properties": {
+                "title": "Processing time per PDF (s)", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["${Ns}", "ProcessingSeconds", "Service", "sigcare-worker", {"stat": "Average"}],
+                  ["${Ns}", "ProcessingSeconds", "Service", "sigcare-worker", {"stat": "Maximum"}]
+                ]}},
+              {"type": "metric", "x": 8, "y": 6, "width": 8, "height": 6, "properties": {
+                "title": "Files waiting in input/ and worker heartbeat", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["${Ns}", "InputBacklog", "Service", "sigcare-worker", {"stat": "Maximum"}],
+                  ["${Ns}", "Heartbeat", "Service", "sigcare-worker", {"stat": "SampleCount"}]
+                ]}},
+              {"type": "metric", "x": 16, "y": 6, "width": 8, "height": 6, "properties": {
+                "title": "Errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["${Ns}", "ErrorLogs", "Service", "sigcare-worker"],
+                  ["${Ns}", "ErrorLogs", "Service", "sigcare-api"],
+                  ["${Ns}", "TextractFailures", "Service", "sigcare-worker"],
+                  ["${Ns}", "ScanErrors", "Service", "sigcare-worker"]
+                ]}},
+              {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
+                "title": "VM CPU", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${InstanceId}", {"stat": "Average"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${InstanceId}", {"stat": "Minimum", "yAxis": "right"}]
+                ]}},
+              {"type": "log", "x": 12, "y": 12, "width": 12, "height": 6, "properties": {
+                "title": "Recent errors", "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${LogGroupPrefix}/worker' | SOURCE '${LogGroupPrefix}/api' | fields @timestamp, service, job_id, source_key, message, error | filter level = 'ERROR' or level = 'CRITICAL' | sort @timestamp desc | limit 50"
+              }}
+            ]
+          }
+        - Ns: !Sub "SigCare/${Environment}"
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=sigcare-${Environment}"

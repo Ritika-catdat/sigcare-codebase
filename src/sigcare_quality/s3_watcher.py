@@ -38,6 +38,7 @@ import os
 import shutil
 import signal
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -48,9 +49,11 @@ import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
+from .observability import configure_logging, emit_metric, emit_metrics, log_context
 from .processing import JobStatus, now_iso, process_document
 
-LOG = logging.getLogger(__name__)
+# Fixed name: run as `python -m`, __name__ would be "__main__".
+LOG = logging.getLogger("sigcare_quality.s3_watcher")
 
 MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
 
@@ -260,6 +263,7 @@ class S3Watcher:
         if self._exists(processed_key):
             LOG.info("Already archived; removing duplicate input %s", input_key)
             self.s3.delete_object(Bucket=bucket, Key=input_key)
+            emit_metric("DuplicatesRemoved")
             return "DUPLICATE"
         previous = self._read_json(status_key)
         if previous and previous.get("status") == "FAILED":
@@ -286,77 +290,89 @@ class S3Watcher:
         }
         run_status = {"job_id": job_id, "status": "RUNNING", "started_at": now_iso(),
                       "error": None, "s3": s3_info}
-        LOG.info("Processing s3://%s/%s", bucket, input_key)
+        started = time.monotonic()
+        with log_context(job_id=job_id):
+            LOG.info("Processing s3://%s/%s", bucket, input_key)
 
-        try:
-            # Save the untouched input before any cleaning so outputs can be
-            # verified against the original later.
-            self._copy(input_key, original_key)
-            self.s3.download_file(bucket, input_key, str(local_pdf))
-            run_status["original_sha256"] = hashlib.sha256(local_pdf.read_bytes()).hexdigest()
-            self._put_json(status_key, run_status)
-
-            status = JobStatus(job_dir, job_id, name)
-            result = process_document(
-                input_pdf=local_pdf,
-                job_dir=job_dir,
-                job_id=job_id,
-                source_file_name=name,
-                status=status,
-                dpi=self.config.dpi,
-                split_stem=stem,
-                path_base=job_dir,
-                # The original lands in processed/ once the run succeeds.
-                original_pdf_location=f"s3://{bucket}/{processed_key}",
-                artifact_location=lambda rel: f"s3://{bucket}/{intermediary}{intermediary_path(rel)}",
-            )
-            self._point_result_at_s3(result, intermediary)
-            result["s3"] = s3_info
-            result["original_sha256"] = run_status["original_sha256"]
-            (job_dir / "result.json").write_text(
-                json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-
-            uploaded = self._upload_job(job_dir, intermediary)
-            self._put_json(result_key, result)
-            self._put_json(summary_key, {
-                "source_key": input_key,
-                "job_id": job_id,
-                "status": result["status"],
-                "source_page_count": result["source_page_count"],
-                "prescriptions_created": result["prescriptions_created"],
-                "removed_frontsheet_pages": result["frontsheet_detection"]["likely_frontsheet_pages"],
-                "removed_blank_pages": result["frontsheet_detection"]["blank_pages"],
-                "artifacts_uploaded": uploaded,
-                "original_sha256": run_status["original_sha256"],
-                "processed_at_utc": now_iso(),
-                "note": result.get("note"),
-            })
-            # Move the input to processed/ only after every output is stored.
-            self._copy(input_key, processed_key)
-            self.s3.delete_object(Bucket=bucket, Key=input_key)
-
-            run_status.update(status=result["status"], finished_at=now_iso(),
-                              prescriptions=result["prescriptions_created"],
-                              artifacts_uploaded=uploaded)
-            self._put_json(status_key, run_status)
-            LOG.info("Done %s -> %s (%s, %d prescriptions)",
-                     input_key, processed_key, result["status"], result["prescriptions_created"])
-            return result["status"]
-
-        except Exception as exc:
-            LOG.exception("Processing failed for %s; source retained for investigation", input_key)
-            run_status.update(status="FAILED", finished_at=now_iso(),
-                              error=f"{type(exc).__name__}: {exc}")
             try:
-                # Keep whatever was produced for diagnosis.
-                self._upload_job(job_dir, intermediary)
+                # Save the untouched input before any cleaning so outputs can be
+                # verified against the original later.
+                self._copy(input_key, original_key)
+                self.s3.download_file(bucket, input_key, str(local_pdf))
+                run_status["original_sha256"] = hashlib.sha256(local_pdf.read_bytes()).hexdigest()
                 self._put_json(status_key, run_status)
-            except Exception:
-                LOG.exception("Could not record failure for %s", input_key)
-            return "FAILED"
-        finally:
-            if not self.config.keep_local:
-                shutil.rmtree(job_dir, ignore_errors=True)
+
+                status = JobStatus(job_dir, job_id, name)
+                result = process_document(
+                    input_pdf=local_pdf,
+                    job_dir=job_dir,
+                    job_id=job_id,
+                    source_file_name=name,
+                    status=status,
+                    dpi=self.config.dpi,
+                    split_stem=stem,
+                    path_base=job_dir,
+                    # The original lands in processed/ once the run succeeds.
+                    original_pdf_location=f"s3://{bucket}/{processed_key}",
+                    artifact_location=lambda rel: f"s3://{bucket}/{intermediary}{intermediary_path(rel)}",
+                )
+                self._point_result_at_s3(result, intermediary)
+                result["s3"] = s3_info
+                result["original_sha256"] = run_status["original_sha256"]
+                (job_dir / "result.json").write_text(
+                    json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+
+                uploaded = self._upload_job(job_dir, intermediary)
+                self._put_json(result_key, result)
+                self._put_json(summary_key, {
+                    "source_key": input_key,
+                    "job_id": job_id,
+                    "status": result["status"],
+                    "source_page_count": result["source_page_count"],
+                    "prescriptions_created": result["prescriptions_created"],
+                    "removed_frontsheet_pages": result["frontsheet_detection"]["likely_frontsheet_pages"],
+                    "removed_blank_pages": result["frontsheet_detection"]["blank_pages"],
+                    "artifacts_uploaded": uploaded,
+                    "original_sha256": run_status["original_sha256"],
+                    "processed_at_utc": now_iso(),
+                    "note": result.get("note"),
+                })
+                # Move the input to processed/ only after every output is stored.
+                self._copy(input_key, processed_key)
+                self.s3.delete_object(Bucket=bucket, Key=input_key)
+
+                run_status.update(status=result["status"], finished_at=now_iso(),
+                                  prescriptions=result["prescriptions_created"],
+                                  artifacts_uploaded=uploaded)
+                self._put_json(status_key, run_status)
+                LOG.info("Done %s -> %s (%s, %d prescriptions)",
+                         input_key, processed_key, result["status"], result["prescriptions_created"],
+                         extra={"job_status": result["status"],
+                                "prescriptions": result["prescriptions_created"]})
+                emit_metrics({
+                    "DocumentsProcessed": 1,
+                    "DocumentsNeedingReview": int(result["status"] != "COMPLETED"),
+                })
+                return result["status"]
+
+            except Exception as exc:
+                LOG.exception("Processing failed for %s; source retained for investigation", input_key,
+                              extra={"job_status": "FAILED"})
+                emit_metric("DocumentsFailed")
+                run_status.update(status="FAILED", finished_at=now_iso(),
+                                  error=f"{type(exc).__name__}: {exc}")
+                try:
+                    # Keep whatever was produced for diagnosis.
+                    self._upload_job(job_dir, intermediary)
+                    self._put_json(status_key, run_status)
+                except Exception:
+                    LOG.exception("Could not record failure for %s", input_key)
+                return "FAILED"
+            finally:
+                emit_metric("ProcessingSeconds", round(time.monotonic() - started, 1),
+                            unit="Seconds")
+                if not self.config.keep_local:
+                    shutil.rmtree(job_dir, ignore_errors=True)
 
     @staticmethod
     def _point_result_at_s3(result: dict[str, Any], intermediary: str) -> None:
@@ -378,14 +394,18 @@ class S3Watcher:
 
     def scan_once(self) -> dict[str, str]:
         outcomes: dict[str, str] = {}
-        for day in self.days_to_scan():
-            for key in self.pending_inputs(day):
-                if self._stop.is_set():
-                    return outcomes
-                if self.config.dry_run:
-                    LOG.info("[DRY RUN] Eligible input PDF: s3://%s/%s", self.config.bucket, key)
-                    outcomes[key] = "DRY_RUN"
-                    continue
+        pending = [key for day in self.days_to_scan() for key in self.pending_inputs(day)]
+        # Files waiting in input/, including failed ones left for a human; a
+        # backlog that keeps growing means processing is falling behind or stuck.
+        emit_metric("InputBacklog", len(pending))
+        for key in pending:
+            if self._stop.is_set():
+                return outcomes
+            if self.config.dry_run:
+                LOG.info("[DRY RUN] Eligible input PDF: s3://%s/%s", self.config.bucket, key)
+                outcomes[key] = "DRY_RUN"
+                continue
+            with log_context(source_key=key):
                 outcomes[key] = self.process_key(key)
         return outcomes
 
@@ -399,6 +419,10 @@ class S3Watcher:
             except Exception:
                 LOG.exception("Could not scan S3 input folders; retrying in %ss",
                               self.config.interval_seconds)
+                emit_metric("ScanErrors")
+            else:
+                # Alarmed on when missing: no heartbeat means the worker is down or stuck.
+                emit_metric("Heartbeat")
             self._stop.wait(self.config.interval_seconds)
         LOG.info("Watcher stopped.")
 
@@ -411,10 +435,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Process prescription PDFs from the day's S3 input folder.")
     parser.add_argument("--once", action="store_true", help="scan once and exit")
     args = parser.parse_args()
-    logging.basicConfig(
-        level=_env("SIGCARE_LOG_LEVEL", "LOG_LEVEL", default="INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    configure_logging("sigcare-worker")
     watcher = S3Watcher(WatcherConfig.from_env())
     signal.signal(signal.SIGTERM, watcher.stop)
     signal.signal(signal.SIGINT, watcher.stop)

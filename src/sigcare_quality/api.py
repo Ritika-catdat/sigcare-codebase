@@ -19,17 +19,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import fitz
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 import pytesseract
 
+from .observability import configure_logging, emit_metric, emit_metrics, log_context
 from .processing import JobStatus, process_document
 from .textract_integration import readiness_checks
 
@@ -40,11 +43,10 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 # Whole jobs run one after another by default; each job is CPU heavy (Tesseract, OpenCV).
 JOB_WORKERS = int(os.getenv("SIGCARE_JOB_WORKERS", "1"))
 
-logging.basicConfig(
-    level=os.getenv("SIGCARE_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+configure_logging("sigcare-api")
 LOG = logging.getLogger("sigcare_quality.api")
+# Accept a caller's X-Request-ID only if it is a short, safe token.
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="sigcare-job")
 
@@ -67,22 +69,61 @@ def _process_job(
     status: JobStatus,
 ) -> None:
     job_dir = OUTPUT_ROOT / job_id
-    try:
-        process_document(
-            input_pdf=job_dir / "input" / "uploaded.pdf",
-            job_dir=job_dir,
-            job_id=job_id,
-            source_file_name=source_file_name,
-            status=status,
-            dpi=dpi,
-            create_cleanup=create_cleanup,
-            path_base=OUTPUT_ROOT,
-            original_pdf_location=f"{job_id}/input/uploaded.pdf",
+    started = time.monotonic()
+    with log_context(job_id=job_id, source_file=source_file_name):
+        try:
+            result = process_document(
+                input_pdf=job_dir / "input" / "uploaded.pdf",
+                job_dir=job_dir,
+                job_id=job_id,
+                source_file_name=source_file_name,
+                status=status,
+                dpi=dpi,
+                create_cleanup=create_cleanup,
+                path_base=OUTPUT_ROOT,
+                original_pdf_location=f"{job_id}/input/uploaded.pdf",
+            )
+        except Exception as exc:
+            # Keep the job directory so partial outputs can be inspected.
+            LOG.exception("[%s] processing failed", job_id, extra={"job_status": "FAILED"})
+            status.update(status="FAILED", error=f"{type(exc).__name__}: {exc}")
+            emit_metric("DocumentsFailed")
+        else:
+            emit_metrics({
+                "DocumentsProcessed": 1,
+                "DocumentsNeedingReview": int(result["status"] != "COMPLETED"),
+            })
+        finally:
+            emit_metric("ProcessingSeconds", round(time.monotonic() - started, 1),
+                        unit="Seconds")
+
+
+@app.middleware("http")
+async def request_log(request: Request, call_next):
+    """Tag each request with an ID (returned as X-Request-ID) and log one line per request."""
+    incoming = request.headers.get("x-request-id", "")
+    request_id = incoming if REQUEST_ID_PATTERN.match(incoming) else uuid.uuid4().hex
+    started = time.monotonic()
+    with log_context(request_id=request_id):
+        try:
+            response = await call_next(request)
+        except Exception:
+            LOG.exception("Unhandled error on %s %s", request.method, request.url.path,
+                          extra={"method": request.method, "path": request.url.path,
+                                 "status_code": 500})
+            raise
+        LOG.info(
+            "%s %s %d", request.method, request.url.path, response.status_code,
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "client_ip": request.client.host if request.client else None,
+            },
         )
-    except Exception as exc:
-        # Keep the job directory so partial outputs can be inspected.
-        LOG.exception("[%s] processing failed", job_id)
-        status.update(status="FAILED", error=f"{type(exc).__name__}: {exc}")
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # --------------------------- API helpers ---------------------------
@@ -186,7 +227,9 @@ async def quality_check(
     source_file_name = Path(file.filename).name
     status = JobStatus(job_dir, job_id, source_file_name)
     JOB_EXECUTOR.submit(_process_job, job_id, source_file_name, dpi, create_cleanup, status)
-    LOG.info("[%s] queued %s (%d pages)", job_id, source_file_name, source_page_count)
+    LOG.info("[%s] queued %s (%d pages)", job_id, source_file_name, source_page_count,
+             extra={"job_id": job_id, "job_status": "QUEUED", "source_pages": source_page_count})
+    emit_metric("DocumentsReceived")
 
     return {
         "job_id": job_id,
