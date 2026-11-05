@@ -16,6 +16,9 @@ Bucket layout (agreed folder structure; the bucket differs between test and prod
         manifest/job_summary.json          written last, when the run succeeded
     .../<dd>/processed/<file>.pdf          the input file, moved here once processed
     .../<dd>/processed/<file stem>.json    final structured result
+    .../<dd>/intermediary/<file stem>/manifest/delivery.json
+                                           outcome of sending the result to the
+                                           Healthya intake API (when enabled)
 
 Rules (same as the earlier VM worker):
 - input whose processed/<file> already exists is a duplicate and is deleted;
@@ -23,6 +26,9 @@ Rules (same as the earlier VM worker):
   and is skipped;
 - a failed file stays in input/ with manifest/status.json FAILED and is skipped
   from then on. Delete that status.json to retry it.
+- once a file is processed, its result JSON is sent to the intake API. A failed
+  delivery does not undo processing: the result stays in processed/ and can be
+  resent with `python -m sigcare_quality.intake_client s3://<bucket>/<result key>`.
 
 Run:
     python -m sigcare_quality.s3_watcher            # poll forever
@@ -49,6 +55,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
+from .intake_client import DeliveryResult, IntakeClient
 from .observability import configure_logging, emit_metric, emit_metrics, log_context
 from .processing import JobStatus, now_iso, process_document
 
@@ -140,6 +147,8 @@ def intermediary_path(relative: str) -> str | None:
 class S3Watcher:
     config: WatcherConfig
     s3: Any = None
+    # Sends each finished result to the Healthya intake API; None = do not send.
+    intake: IntakeClient | None = None
     _stop: threading.Event = field(default_factory=threading.Event)
     _warned: set[str] = field(default_factory=set)
 
@@ -341,9 +350,13 @@ class S3Watcher:
                 self._copy(input_key, processed_key)
                 self.s3.delete_object(Bucket=bucket, Key=input_key)
 
+                # Processing is complete and saved; delivery cannot undo that.
+                delivery = self._deliver(result, intermediary)
+
                 run_status.update(status=result["status"], finished_at=now_iso(),
                                   prescriptions=result["prescriptions_created"],
-                                  artifacts_uploaded=uploaded)
+                                  artifacts_uploaded=uploaded,
+                                  intake_delivery=delivery.status if delivery else None)
                 self._put_json(status_key, run_status)
                 LOG.info("Done %s -> %s (%s, %d prescriptions)",
                          input_key, processed_key, result["status"], result["prescriptions_created"],
@@ -373,6 +386,26 @@ class S3Watcher:
                             unit="Seconds")
                 if not self.config.keep_local:
                     shutil.rmtree(job_dir, ignore_errors=True)
+
+    def _deliver(self, result: dict[str, Any], intermediary: str) -> DeliveryResult | None:
+        """Send the result to the intake API and record the outcome. Never raises."""
+        if self.intake is None or not self.intake.config.enabled:
+            return None
+        try:
+            delivery = self.intake.send(result)
+        except Exception as exc:
+            # send() handles HTTP errors itself; this guards against bugs, because
+            # the file is already in processed/ and must not be marked FAILED.
+            LOG.exception("Intake delivery crashed")
+            emit_metric("IntakeFailed")
+            delivery = DeliveryResult(status="FAILED", job_id=result.get("job_id"),
+                                      message=f"{type(exc).__name__}: {exc}"[:300],
+                                      endpoint=self.intake.config.host)
+        try:
+            self._put_json(f"{intermediary}manifest/delivery.json", delivery.to_record())
+        except Exception:
+            LOG.exception("Could not save the intake delivery record")
+        return delivery
 
     @staticmethod
     def _point_result_at_s3(result: dict[str, Any], intermediary: str) -> None:
@@ -410,9 +443,11 @@ class S3Watcher:
         return outcomes
 
     def run_forever(self) -> None:
-        LOG.info("S3 watcher started; bucket=%s, today=%s, interval=%ss, dry_run=%s",
+        LOG.info("S3 watcher started; bucket=%s, today=%s, interval=%ss, dry_run=%s, intake=%s",
                  self.config.bucket, date_prefix(self.days_to_scan()[-1], self.config),
-                 self.config.interval_seconds, self.config.dry_run)
+                 self.config.interval_seconds, self.config.dry_run,
+                 self.intake.config.host if self.intake and self.intake.config.enabled
+                 else "disabled")
         while not self._stop.is_set():
             try:
                 self.scan_once()
@@ -436,7 +471,8 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="scan once and exit")
     args = parser.parse_args()
     configure_logging("sigcare-worker")
-    watcher = S3Watcher(WatcherConfig.from_env())
+    # Raises on a bad intake configuration so the worker fails at start, not per file.
+    watcher = S3Watcher(WatcherConfig.from_env(), intake=IntakeClient.from_env())
     signal.signal(signal.SIGTERM, watcher.stop)
     signal.signal(signal.SIGINT, watcher.stop)
     if args.once:

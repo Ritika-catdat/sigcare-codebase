@@ -156,6 +156,26 @@ Resources:
       AlarmActions: [!Ref AlertTopicArn]
       OKActions: [!Ref AlertTopicArn]
 
+  IntakeDeliveryFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sigcare-${Environment}-intake-delivery-failed"
+      AlarmDescription: >-
+        A result could not be sent to the Healthya intake API after all retries.
+        The result is still saved in processed/<file>.json; see
+        intermediary/<file>/manifest/delivery.json for the reason, then resend with
+        python -m sigcare_quality.intake_client s3://<bucket>/<result key>.
+      Namespace: !Sub "SigCare/${Environment}"
+      MetricName: IntakeFailed
+      Dimensions: [{ Name: Service, Value: sigcare-worker }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopicArn]
+
   CpuCreditsLowAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -216,6 +236,19 @@ Resources:
                   ["${Ns}", "ErrorLogs", "Service", "sigcare-api"],
                   ["${Ns}", "TextractFailures", "Service", "sigcare-worker"],
                   ["${Ns}", "ScanErrors", "Service", "sigcare-worker"]
+                ]}},
+              {"type": "metric", "x": 0, "y": 18, "width": 12, "height": 6, "properties": {
+                "title": "Healthya intake API deliveries", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["${Ns}", "IntakeDelivered", "Service", "sigcare-worker"],
+                  ["${Ns}", "IntakeDuplicate", "Service", "sigcare-worker"],
+                  ["${Ns}", "IntakeFailed", "Service", "sigcare-worker"]
+                ]}},
+              {"type": "metric", "x": 12, "y": 18, "width": 12, "height": 6, "properties": {
+                "title": "Intake API time per result (s)", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["${Ns}", "IntakeSeconds", "Service", "sigcare-worker", {"stat": "Average"}],
+                  ["${Ns}", "IntakeSeconds", "Service", "sigcare-worker", {"stat": "Maximum"}]
                 ]}},
               {"type": "metric", "x": 0, "y": 12, "width": 12, "height": 6, "properties": {
                 "title": "VM CPU", "region": "${AWS::Region}", "period": 300,
