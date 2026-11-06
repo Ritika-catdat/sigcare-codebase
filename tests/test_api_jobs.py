@@ -43,6 +43,24 @@ def test_delivery_list_cover_page_is_a_front_sheet():
     assert classify_frontsheet(prescription)["likely_frontsheet"] is False
 
 
+def test_charging_sheet_cover_page_is_a_front_sheet():
+    # OCR text as read from the two S22C scans.
+    for text in ("»&\n\nSIG( AKt\n\nHMP CHARGING SHEET:\n\nURGENTS\n\nSITE DATE: }2.]Q\n\n"
+                 "SERVICE USER NAME / HMP ID\n\na\n\nD. Whelan",
+                 "SIG A\n\nHMP CHARGING SHEET:\n\nURGENTS\n\nSITE DATE\n\nIS ho\n\nSERVICE USER NAME / HMP ID"):
+        assert classify_frontsheet(text)["likely_frontsheet"] is True
+
+
+def test_page_two_after_a_misread_counter_joins_the_previous_prescription():
+    # Document_261012_133403 pages 43-46 as read: 43 is complete ("1 of 1"); 44's counter
+    # was misread as "10 of 10", so 45 ("2 of 2") joins 44, but 44 must not join 43.
+    assert processing._group_pages([(1, 1), (10, 10), (2, 2), (9, 10)]) == [[0], [1, 2], [3]]
+    # A complete prescription never takes another page.
+    assert processing._group_pages([(1, 1), (2, 2)]) == [[0], [1]]
+    # Unmarked pages are not guessed at: they stay on their own.
+    assert processing._group_pages([(1, 1), (None, None)]) == [[0], [1]]
+
+
 def test_remove_pages_and_split_keep_original_page_numbers(tmp_path):
     source = tmp_path / "in.pdf"
     _make_pdf(source, [

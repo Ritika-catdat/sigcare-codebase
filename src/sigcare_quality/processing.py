@@ -112,6 +112,12 @@ def _get_marker(page: fitz.Page, ocr_text: str | None = None) -> tuple[int | Non
         ) from exc
 
 
+def _complete(group: list[int], markers: list[tuple[int | None, int | None]]) -> bool:
+    """True when the group starts at 'Page 1 of N' and already has its N pages."""
+    current, total = markers[group[0]]
+    return current == 1 and total is not None and len(group) >= total
+
+
 def _group_pages(markers: list[tuple[int | None, int | None]]) -> list[list[int]]:
     """Group pages by page-of-total counters; indices are zero-based."""
     groups: list[list[int]] = []
@@ -138,6 +144,13 @@ def _group_pages(markers: list[tuple[int | None, int | None]]) -> list[list[int]
                 j += 1
             groups.append(group)
             i = j
+        elif (current is not None and current > 1 and groups
+              and current == len(groups[-1]) + 1 and not _complete(groups[-1], markers)):
+            # "Page 2 of 2" is never the first page of a prescription. It gets here when
+            # the counter on the page before was misread ("10 of 10"), so it joins that
+            # prescription - only as its next page, and never one already complete.
+            groups[-1].append(i)
+            i += 1
         else:
             # Unmarked pages remain single-page prescriptions unless consumed as
             # an expected continuation by the preceding group.

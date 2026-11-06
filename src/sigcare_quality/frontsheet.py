@@ -34,6 +34,14 @@ DELIVERY_LIST_PATTERNS = {
     "number_of_meds": r"\bnumber\s+of\s+meds?\b",
 }
 
+CHARGING_SHEET_PATTERNS = {
+    "charging_sheet": r"\bcharging\s+sheet\b",
+    "service_user_name": r"\bservice\s+user\s+name\b",
+    "hmp_id": r"\bhmp\s+id\b",
+    "site_date": r"\bsite\s+date\b",
+    "urgents": r"\burgents\b",
+}
+
 
 # Tesseract processes run in parallel, one page each (pair with OMP_THREAD_LIMIT=1).
 OCR_WORKERS = max(1, int(os.getenv("SIGCARE_OCR_WORKERS", "3")))
@@ -126,11 +134,18 @@ def classify_frontsheet(text):
                      if re.search(pattern, normalized)]
     matches.extend(delivery_list)
 
+    # A third cover page: "HMP CHARGING SHEET: URGENTS" listing "SERVICE USER NAME / HMP ID".
+    charging_sheet = [name for name, pattern in CHARGING_SHEET_PATTERNS.items()
+                      if re.search(pattern, normalized)]
+    matches.extend(charging_sheet)
+
     likely_frontsheet = (
         heading_found and supporting_count >= 1
     ) or (
         not heading_found and supporting_count >= 4
-    ) or len(delivery_list) >= 3 or {"sent_on", "delivery_on"} <= set(delivery_list)
+    ) or len(delivery_list) >= 3 or {"sent_on", "delivery_on"} <= set(delivery_list) or (
+        "charging_sheet" in charging_sheet and len(charging_sheet) >= 2
+    ) or len(charging_sheet) >= 3
 
     return {
         "likely_frontsheet": likely_frontsheet,
