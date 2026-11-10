@@ -7,7 +7,7 @@ import boto3
 from .config import Config
 from .textract_ocr import TextractOCR
 from .document_parser import Document
-from .patient_provider_extractor import extract_patient, extract_provider
+from .patient_provider_extractor import extract_patient, extract_prescription_date, extract_provider
 from .medication_table_extractor import extract_tables
 from .handwriting_detector import detect_handwriting
 from .output_contract import build_output
@@ -50,6 +50,7 @@ def extract(response, source, cfg=None):
         'source': source,
         'provider': provider,
         'patient': patient,
+        'prescription_date': extract_prescription_date(doc),
         **data,
         'extraction_metadata': {
             'status': status,

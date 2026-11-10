@@ -1,5 +1,9 @@
 import re
+from .handwriting_detector import DATE_TEXT, below_signature, signature_labels
 from .schemas import PATIENT, match_score, norm
+
+# Dates on other labels near the signature are not the prescription date.
+OTHER_DATE_LABELS = re.compile(r'\b(birth|dob|start|end|stop)\b')
 
 
 def _value(value, provenance):
@@ -126,6 +130,29 @@ def extract_patient(doc):
     output['landing'] = _value(landing, landing_prov)
     output['cell'] = _value(cell, cell_prov)
     return output
+
+
+def extract_prescription_date(doc):
+    """The date below the prescriber's signature (printed or handwritten).
+
+    The last "Signed:" label is used, so on a multi-page prescription it is the
+    signature at the end. The nearest date under it is taken. Without a readable label,
+    a line starting with "Date" on the last page is used instead.
+    """
+    labels = signature_labels(doc)
+    if labels:
+        label = max(labels, key=lambda l: (l.get('Page', 1), doc.bbox(l).get('Top', 0)))
+        lines = sorted((l for l in doc.lines(label.get('Page', 1)) if below_signature(doc, l, [label])),
+                       key=lambda l: doc.bbox(l).get('Top', 0))
+    else:
+        last_page = max(doc.pages, default=1)
+        lines = [l for l in reversed(doc.lines(last_page)) if norm(l.get('Text', '')).startswith('date')]
+    for line in lines:
+        text = line.get('Text', '')
+        found = DATE_TEXT.search(text)
+        if found and not OTHER_DATE_LABELS.search(norm(text)):
+            return _value(found.group(), doc.provenance([line['Id']]))
+    return _value(None, None)
 
 
 def extract_provider(doc):

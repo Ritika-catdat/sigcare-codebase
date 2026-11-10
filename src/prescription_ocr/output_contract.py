@@ -108,25 +108,17 @@ def _patient_field(patient, name):
     return _str(field.get('value')), _provenance_confidence(field.get('provenance'))
 
 
-def _landing_and_cell(patient):
-    landing, _ = _patient_field(patient, 'landing')
-    cell, _ = _patient_field(patient, 'cell')
-    combined, _ = _patient_field(patient, 'landing_cell')
-    if combined and (not landing or not cell):
-        parts = re.split(r'\s*/\s*|\s*\|\s*', combined, maxsplit=1)
-        if len(parts) == 2:
-            landing = landing or parts[0]
-            cell = cell or parts[1]
-        elif not landing:
-            landing = combined
-    return landing, cell
-
-
 def _record(row, fields):
-    out = {name: _str(row.get(name)) for name in fields}
     # Keep distinct prescriber_name and prescriber in the externally specified schema;
     # when only one printed header exists, do NOT hallucinate the other value.
     provenance = row.get('_provenance') or {}
+    out = {}
+    for name in fields:
+        out[name] = _str(row.get(name))
+        if name == 'script_notes':
+            # Script notes are checked on their own confidence, not only the record average.
+            out['script_notes_ocr_confidence'] = (
+                _avg([_provenance_confidence(provenance.get(name))]) if out[name].strip() else '')
     confidences = [_provenance_confidence(provenance.get(k)) for k in fields if row.get(k) not in (None, '')]
     out['record_ocr_confidence'] = _avg(confidences)
     return out
@@ -162,7 +154,7 @@ def _review_reasons(values, notes_present, overall, in_possession, not_in_posses
     if notes_present:
         reasons.append('Handwritten notes present')
     for field, label in (('name','patient_name'), ('date_of_birth','date_of_birth'),
-                         ('age','age'), ('prisoner_number','prisoner_number')):
+                         ('prisoner_number','prisoner_number')):
         if not str(values.get(field) or '').strip():
             reasons.append(f'Missing required patient field: {label}')
     # 0.9 normalized threshold corresponds to 90.0 on Textract's 0–100 scale.
@@ -181,6 +173,16 @@ def _review_reasons(values, notes_present, overall, in_possession, not_in_posses
                 reasons.append(f'{section} record {index}: OCR confidence unavailable')
             elif conf < 90.0:
                 reasons.append(f'{section} record {index}: OCR confidence below 0.9: {conf / 100:.4f}')
+            if not isinstance(record, dict):
+                continue
+            if _str(record.get('medication_notes')).strip():
+                reasons.append(f'{section} record {index}: medication notes present')
+            if _str(record.get('script_notes')).strip():
+                conf = record.get('script_notes_ocr_confidence')
+                if not isinstance(conf, (int, float)):
+                    reasons.append(f'{section} record {index}: script notes OCR confidence unavailable')
+                elif conf < 90.0:
+                    reasons.append(f'{section} record {index}: script notes OCR confidence below 0.9: {conf / 100:.4f}')
     if not in_possession and not not_in_possession:
         reasons.append('Neither in_possession nor not_in_possession contains a record')
     # Retain upstream detected issues, e.g. handwritten tables or failed table classification.
@@ -191,15 +193,16 @@ def _review_reasons(values, notes_present, overall, in_possession, not_in_posses
 
 def build_output(internal, doc, handwriting, source, output_bucket, output_key):
     patient = internal['patient']
-    identity_fields = ('name','date_of_birth','age','prisoner_number','wing','landing','cell')
+    # Age, wing, landing and cell are not part of the output (their labels are still
+    # recognised during extraction, so they are never taken as another field's value).
+    identity_fields = ('name','date_of_birth','prisoner_number')
     values, confidence = {}, []
     for name in identity_fields:
         value, conf = _patient_field(patient, name)
         values[name] = value
         if value and conf is not None:
             confidence.append(conf)
-    landing, cell = _landing_and_cell(patient)
-    values['landing'], values['cell'] = landing, cell
+    prescription_date = _str((internal.get('prescription_date') or {}).get('value'))
     ip = [_record(r, IN_FIELDS) for r in internal.get('in_possession_medicines', [])]
     nip = [_record(r, NOT_FIELDS) for r in internal.get('not_in_possession_medicines', [])]
     allergy = [_record(r, ALLERGY_FIELDS) for r in internal.get('allergies', [])]
@@ -234,12 +237,10 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
         **split_name(values['name']),
         'date_of_birth': values['date_of_birth'],
         'date_of_birth_transformed': transform_date(values['date_of_birth']),
-        'age': values['age'],
         'prisoner_number': values['prisoner_number'],
-        'wing': values['wing'],
-        'Landing': landing,
-        'cell': cell,
         'identification_ocr_confidence': identification_confidence,
+        'prescription_date': prescription_date,
+        'prescription_date_transformed': transform_date(prescription_date),
         'in_possession': ip,
         'in_possession_record_count': len(ip),
         'not_in_possession': nip,
@@ -263,8 +264,8 @@ def failed_output(source, reasons):
     """Same contract for a prescription whose extraction could not run at all."""
     return {
         'site_name': '', 'address': '', **split_address('', ''),
-        'patient_name': '', **split_name(''), 'date_of_birth': '', 'date_of_birth_transformed': '', 'age': '', 'prisoner_number': '', 'wing': '',
-        'Landing': '', 'cell': '', 'identification_ocr_confidence': '',
+        'patient_name': '', **split_name(''), 'date_of_birth': '', 'date_of_birth_transformed': '', 'prisoner_number': '',
+        'identification_ocr_confidence': '', 'prescription_date': '', 'prescription_date_transformed': '',
         'in_possession': [], 'in_possession_record_count': 0,
         'not_in_possession': [], 'not_in_possession_record_count': 0,
         'allergy': [], 'allergy_record_count': 0,

@@ -7,6 +7,26 @@ SIGNATURE_LABEL = re.compile(r'^(signed|signature|sign)\b')
 MIN_NOTE_CHARS = 3
 # How far right of a "Signed:" label (fraction of page width) a signature can reach.
 SIGNATURE_REACH = .35
+# How far below a "Signed:" label (fraction of page height) its date can be.
+SIGNATURE_DATE_REACH = .15
+DATE_TEXT = re.compile(r'\b\d{1,2}(?:st|nd|rd|th)?[\s/.-]+(?:\d{1,2}|[A-Za-z]{3,9})[\s/.-]+\d{2,4}\b',
+                       re.IGNORECASE)
+
+
+def signature_labels(doc):
+    return [l for l in doc.lines() if SIGNATURE_LABEL.match(norm(l.get('Text', '')))]
+
+
+def below_signature(doc, block, labels):
+    """True when the block sits in the date area under one of the "Signed:" labels."""
+    b = doc.bbox(block)
+    for label in labels:
+        lb = doc.bbox(label)
+        if (label.get('Page', 1) == block.get('Page', 1)
+                and lb.get('Top', 0) - .5 * lb.get('Height', 0) < b.get('Top', 0)
+                <= lb.get('Top', 0) + SIGNATURE_DATE_REACH):
+            return True
+    return False
 TITLES = {'dr', 'mr', 'mrs', 'ms', 'miss', 'prof', 'printed', 'by', 'prescriber', 'name', 'signed'}
 
 
@@ -51,7 +71,7 @@ def signature_word_ids(doc, hand):
     catch a signature showing through from the next sheet. A real sentence written
     next to the signature ("Please dispense 7 days") is longer and stays a note.
     """
-    labels = [l for l in doc.lines() if SIGNATURE_LABEL.match(norm(l.get('Text', '')))]
+    labels = signature_labels(doc)
     names = clinician_names(doc)
 
     def near_label(w):
@@ -76,11 +96,17 @@ def signature_word_ids(doc, hand):
         # note has at least a short word.
         return len(re.sub(r'[^a-z0-9]', '', ''.join(w.get('Text', '') for w in words).casefold())) < MIN_NOTE_CHARS
 
+    def is_signature_date(words):
+        # The date written under the signature is the prescription date, not a note.
+        text = ' '.join(w.get('Text', '') for w in words)
+        return len(words) <= 4 and DATE_TEXT.search(text) and all(below_signature(doc, w, labels) for w in words)
+
     found = set()
     for _, words in handwritten_lines(doc, hand):
         if (is_scrawl(words)
                 or (len(words) <= 3 and any(is_name(w) for w in words))
-                or (len(words) <= 2 and all(near_label(w) for w in words))):
+                or (len(words) <= 2 and all(near_label(w) for w in words))
+                or is_signature_date(words)):
             found.update(w['Id'] for w in words)
     return found
 

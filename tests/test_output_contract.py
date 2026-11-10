@@ -12,8 +12,8 @@ def test_exact_output_schema_and_confidences():
                           {'prescription_id':'some-id','bucket':'b','key':'preprocessed/RX001.pdf'}, 'b', 'extracted/RX001.json')
     assert list(result) == ['site_name','address','address_line_1','address_line_2','address_line_3','city','county','postcode',
                            'patient_name','salutation','first_name','middle_name','last_name',
-                           'date_of_birth','date_of_birth_transformed','age','prisoner_number','wing','Landing','cell',
-                           'identification_ocr_confidence','in_possession','in_possession_record_count',
+                           'date_of_birth','date_of_birth_transformed','prisoner_number',
+                           'identification_ocr_confidence','prescription_date','prescription_date_transformed','in_possession','in_possession_record_count',
                            'not_in_possession','not_in_possession_record_count','allergy','allergy_record_count',
                            'hand_written_notes_present','hand_written_notes','notes_records_count',
                            'flag_for_review','review_reason','overall_ocr_confidence','file_name','prescription_number',
@@ -21,7 +21,9 @@ def test_exact_output_schema_and_confidences():
     assert result['patient_name'] == 'Alice'
     assert result['in_possession_record_count'] == 1
     assert result['in_possession'][0]['record_ocr_confidence'] == 99
-    assert list(result['in_possession'][0]) == list(IN_FIELDS) + ['record_ocr_confidence']
+    fields = list(IN_FIELDS)
+    fields.insert(fields.index('script_notes') + 1, 'script_notes_ocr_confidence')
+    assert list(result['in_possession'][0]) == fields + ['record_ocr_confidence']
     assert result['overall_ocr_confidence'] == 99
     assert result['original_pdf_location'] == ''
     assert result['prescription_number'] == ''
@@ -46,10 +48,54 @@ def test_record_shapes_and_handwriting_notes():
         {'note':'Please review','note_ocr_confidence':89}]
 
 
-def test_separate_landing_cell_fields():
-    from prescription_ocr.output_contract import _landing_and_cell
-    p = {'landing':{'value':'C'},'cell':{'value':'12'},'landing_cell':{'value':'C / 12'}}
-    assert _landing_and_cell(p) == ('C','12')
+def test_script_notes_keep_their_own_confidence():
+    from prescription_ocr.output_contract import _record
+    row = {'drug_name': 'Laxido', 'script_notes': 'Take at night',
+           '_provenance': {'drug_name': {'ocr_confidence': 99}, 'script_notes': {'ocr_confidence': 85.5}}}
+    assert _record(row, IN_FIELDS)['script_notes_ocr_confidence'] == 85.5
+    assert _record({'drug_name': 'Laxido'}, IN_FIELDS)['script_notes_ocr_confidence'] == ''
+
+
+def test_medication_notes_and_unclear_script_notes_go_for_review():
+    from prescription_ocr.output_contract import _review_reasons
+    identity = {'name': 'Jane', 'date_of_birth': '1990-01-01', 'prisoner_number': 'P123'}
+    ip = [{'record_ocr_confidence': 99, 'medication_notes': '', 'script_notes': 'Take at night',
+           'script_notes_ocr_confidence': 89.5},
+          {'record_ocr_confidence': 99, 'medication_notes': '', 'script_notes': 'Weekly',
+           'script_notes_ocr_confidence': 90},
+          {'record_ocr_confidence': 99, 'medication_notes': '', 'script_notes': '', 'script_notes_ocr_confidence': ''}]
+    nip = [{'record_ocr_confidence': 99, 'medication_notes': 'Supervised'},
+           {'record_ocr_confidence': 99, 'medication_notes': '  '}]
+    assert _review_reasons(identity, False, 99, ip, nip, [], 95) == [
+        'in_possession record 1: script notes OCR confidence below 0.9: 0.8950',
+        'not_in_possession record 1: medication notes present']
+
+
+def test_prescription_date_is_the_date_below_the_signature():
+    from prescription_ocr.patient_provider_extractor import extract_prescription_date
+    from test_prescription_extraction import _line
+    blocks = []
+    _line(blocks, 'stamp', 'Printed on 10 Oct 2026', .02)                 # print stamp, not the date
+    _line(blocks, 'dob', 'Date of birth: 06 Jul 1990', .10)
+    _line(blocks, 'label', 'Signed: ....................', .80)
+    _line(blocks, 'sig', 'M', .78, left=.25, hand=True)
+    _line(blocks, 'date', 'Date: 12 Oct 2026', .84)
+    doc = Document({'Blocks': blocks})
+    assert extract_prescription_date(doc)['value'] == '12 Oct 2026'
+
+
+def test_handwritten_date_under_the_signature_is_not_a_note():
+    from prescription_ocr.handwriting_detector import detect_handwriting
+    from prescription_ocr.patient_provider_extractor import extract_prescription_date
+    from test_prescription_extraction import _line
+    blocks = []
+    _line(blocks, 'label', 'Signed: ....................', .80)
+    _line(blocks, 'date', '12/10/2026', .85, left=.1, hand=True)
+    doc = Document({'Blocks': blocks})
+    assert detect_handwriting(doc, [], Config())['note_word_ids'] == []
+    assert extract_prescription_date(doc)['value'] == '12/10/2026'
+    # No signature date at all: empty, not a guess.
+    assert extract_prescription_date(Document({'Blocks': []}))['value'] is None
 
 
 def test_preprocessing_metadata_is_preserved():
@@ -69,9 +115,10 @@ def test_preprocessing_metadata_is_preserved():
 
 def test_review_reasons_all_triggers_and_boundary():
     from prescription_ocr.output_contract import _review_reasons
-    vals = {'name':'', 'date_of_birth':'', 'age':'', 'prisoner_number':''}
+    vals = {'name':'', 'date_of_birth':'', 'prisoner_number':''}
     reasons = _review_reasons(vals, True, 89.9, [], [], [])
-    assert len(reasons) == 7
+    assert len(reasons) == 6
+    assert not any('age' in r for r in reasons)
     assert 'Handwritten notes present' in reasons
     assert 'Missing required patient field: prisoner_number' in reasons
     assert any('below 0.9' in r for r in reasons)
