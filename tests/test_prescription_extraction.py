@@ -275,6 +275,30 @@ def test_word_run_across_a_column_line_is_split_between_the_cells():
     assert grid[(2, 2)].text == '1 tablet, 1 times per 1 day(s)'
 
 
+def test_word_wrapped_inside_a_narrow_cell_is_joined_back_together():
+    blocks = []
+    def cell(ident, c, ids):
+        blocks.append(block('CELL', ident, RowIndex=1, ColumnIndex=c, Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                            Geometry={'BoundingBox': {'Left': .10 * c, 'Top': .30, 'Width': .10, 'Height': .10}}))
+        return ident
+    # Cell right edges at .20 and .30; a full line ends within two characters (~.01 each) of it.
+    ids = [cell('a', 1, [_word(blocks, 'a1', 'Aripiprazol', .105, .31, .088),     # ends .193
+                         _word(blocks, 'a2', 'e', .105, .33, .008),
+                         _word(blocks, 'a3', '10mg', .115, .33, .03),
+                         _word(blocks, 'a4', 'gastro-', .105, .35, .09),         # ends .195
+                         _word(blocks, 'a5', 'resistant', .105, .37, .07)]),
+           # Word-wrapped line that stops well short of the edge: the space stays.
+           cell('b', 2, [_word(blocks, 'b1', 'Laxido', .205, .31, .05),          # ends .255
+                         _word(blocks, 'b2', 'Orange', .205, .33, .05),
+                         _word(blocks, 'b3', '1', .205, .35, .01),
+                         _word(blocks, 'b4', 'tablet', .215, .35, .05),           # ends .265
+                         _word(blocks, 'b5', 'daily', .205, .37, .04)])]
+    blocks.append(block('TABLE', 't1', Relationships=[{'Type': 'CHILD', 'Ids': ids}]))
+    grid = Document({'Blocks': blocks}).table_grid(blocks[-1])
+    assert grid[(1, 1)].text == 'Aripiprazole 10mg gastro-resistant'
+    assert grid[(1, 2)].text == 'Laxido Orange 1 tablet daily'
+
+
 def test_age_without_a_number_is_read_from_the_row_beside_the_label():
     from prescription_ocr.patient_provider_extractor import extract_patient
     blocks = []

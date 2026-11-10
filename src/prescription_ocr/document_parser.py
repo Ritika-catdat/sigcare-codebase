@@ -105,8 +105,9 @@ class Document:
             anchor = m and row == m.get('RowIndex', row) and col == m.get('ColumnIndex', col)
             shadow = m and not anchor
             source = m if anchor else b
-            text = '' if shadow else self.text_of(source)
             words = [] if shadow else self.child_words(source)
+            text = '' if shadow else self._join_lines([(self.bbox(w), w.get('Text', '')) for w in words],
+                                                      self.bbox(source)) or self.text_of(source)
             # Some MERGED_CELLs list child CELLS; text_of recursively handles those.
             grid[(row, col)] = Cell(text=text, page=b.get('Page', table.get('Page', 1)),
                                     block_ids=[source['Id']], confidence=source.get('Confidence'),
@@ -155,7 +156,32 @@ class Document:
                 changed.add((row, col))
             pieces[(row, col)] = kept
         for key in changed:
-            grid[key].text = ' '.join(t for _, t in pieces[key]).strip()
+            grid[key].text = self._join_lines(pieces[key], grid[key].bbox)
+
+    # A line ending closer than this (in character widths) to the cell's right edge is full.
+    WRAP_EDGE_CHARS = 2
+
+    def _join_lines(self, pieces, cell_box):
+        """Join a cell's words, closing up a word the printer broke across two lines.
+
+        Narrow columns are wrapped by character, so "Aripiprazole" is printed as
+        "Aripiprazol" at the end of one line and "e" at the start of the next. When a line
+        runs to the cell's right edge and the next line carries on with a letter, the two
+        pieces are one word. A word that OCR ran across the edge is not a wrap.
+        """
+        edge = (cell_box or {}).get('Left', 0) + (cell_box or {}).get('Width', 0)
+        out = ''
+        for i, (box, text) in enumerate(pieces):
+            if i and text:
+                prev_box, prev = pieces[i - 1]
+                char = prev_box.get('Width', 0) / max(len(prev), 1)
+                gap = edge - prev_box.get('Left', 0) - prev_box.get('Width', 0)
+                new_line = box.get('Top', 0) >= prev_box.get('Top', 0) + .6 * prev_box.get('Height', 0)
+                wrapped = (cell_box and new_line and -.5 * char <= gap < self.WRAP_EDGE_CHARS * char
+                           and re.search(r'[A-Za-z-]$', prev) and re.match(r'[A-Za-z]', text))
+                out += '' if wrapped else ' '
+            out += text
+        return out.strip()
 
     def _vocabulary(self):
         if not hasattr(self, '_vocab'):
