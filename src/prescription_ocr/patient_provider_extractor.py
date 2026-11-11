@@ -135,19 +135,23 @@ def extract_patient(doc):
 def extract_prescription_date(doc):
     """The date below the prescriber's signature (printed or handwritten).
 
-    The last "Signed:" label is used, so on a multi-page prescription it is the
-    signature at the end. The nearest date under it is taken. Without a readable label,
-    a line starting with "Date" on the last page is used instead.
+    The prescriber signs straight after the medicine tables, so the first "Signed:"
+    label is theirs; the "Medication Received Signatures" lines further down have their
+    own (usually empty) dates and are not used. The nearest date under the first label
+    is taken, stopping at the next "Signed:" line so an allergy start date or the print
+    footer below is never picked up. Without a readable label, the first line starting
+    with "Date" is used instead.
     """
     labels = signature_labels(doc)
     if labels:
-        label = max(labels, key=lambda l: (l.get('Page', 1), doc.bbox(l).get('Top', 0)))
+        label = min(labels, key=lambda l: (l.get('Page', 1), doc.bbox(l).get('Top', 0)))
         lines = sorted((l for l in doc.lines(label.get('Page', 1)) if below_signature(doc, l, [label])),
                        key=lambda l: doc.bbox(l).get('Top', 0))
     else:
-        last_page = max(doc.pages, default=1)
-        lines = [l for l in reversed(doc.lines(last_page)) if norm(l.get('Text', '')).startswith('date')]
+        lines = [l for l in doc.lines() if norm(l.get('Text', '')).startswith('date')]
     for line in lines:
+        if labels and line is not label and line in labels:
+            break
         text = line.get('Text', '')
         found = DATE_TEXT.search(text)
         if found and not OTHER_DATE_LABELS.search(norm(text)):

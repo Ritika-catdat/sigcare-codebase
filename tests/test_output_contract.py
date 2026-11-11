@@ -79,9 +79,21 @@ def test_prescription_date_is_the_date_below_the_signature():
     _line(blocks, 'dob', 'Date of birth: 06 Jul 1990', .10)
     _line(blocks, 'label', 'Signed: ....................', .80)
     _line(blocks, 'sig', 'M', .78, left=.25, hand=True)
-    _line(blocks, 'date', 'Date: 12 Oct 2026', .84)
+    _line(blocks, 'date', 'Date: 12 October 2026', .84)
+    # Below it: the received-signature lines, an allergy table and the print footer.
+    _line(blocks, 'recv', 'Signed: ........ Date: Signed: ........ Date:', .90)
+    _line(blocks, 'allergy', '13 Aug 2026', .94)
+    _line(blocks, 'footer', '12/10/2026 09:54', .97)
     doc = Document({'Blocks': blocks})
-    assert extract_prescription_date(doc)['value'] == '12 Oct 2026'
+    assert extract_prescription_date(doc)['value'] == '12 October 2026'
+
+    # The prescriber left the date empty: nothing further down is used instead.
+    blocks = []
+    _line(blocks, 'label', 'Signed: ....................', .80)
+    _line(blocks, 'date', 'Date:', .84)
+    _line(blocks, 'recv', 'Signed: ........ Date: Signed: ........ Date:', .88)
+    _line(blocks, 'allergy', '13 Aug 2026', .92)
+    assert extract_prescription_date(Document({'Blocks': blocks}))['value'] is None
 
 
 def test_handwritten_date_under_the_signature_is_not_a_note():
