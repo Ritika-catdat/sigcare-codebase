@@ -1,3 +1,4 @@
+from .output_contract import transform_date
 from .schemas import TABLES, CRITICAL_FIELDS, map_headers, classify, match_score, norm
 
 # Every word used in a column header. A row made only of these words is the second
@@ -24,14 +25,61 @@ def is_header_fragment(cells):
     return bool(texts) and all(set(t.split()) <= HEADER_WORDS for t in texts)
 
 
-def merge_into(record, fields, provenance):
-    """Append a row that continues the previous page's last row (a row split by a page break)."""
+def merge_into(record, fields, provenance, separators=None):
+    """Append a row that continues the record's row: a row split by a page break, or the next
+    printed line of a wrapped row. separators gives '' for a word broken across the lines."""
     for field, value in fields.items():
         if not value:
             continue
-        record[field] = f'{record[field]} {value}' if record.get(field) else value
+        sep = (separators or {}).get(field, ' ')
+        record[field] = f'{record[field]}{sep}{value}' if record.get(field) else value
         before = record['_provenance'].get(field)
         record['_provenance'][field] = {'components': [before, provenance[field]]} if before else provenance[field]
+
+
+# Lines closer than this many word heights are lines of one wrapped cell, not two rows:
+# printed lines in a cell sit about a third of a line apart, while ruled rows also have the
+# ruling line and the cell padding between them.
+WRAP_GAP = .55
+
+
+def _words(doc, cells):
+    return [doc.index[i] for c in cells if c for i in c.word_ids if i in doc.index]
+
+
+def is_wrapped_line(doc, upper_cells, cells, record, fields):
+    """True when this row is the next printed line of the record's row, not a new medicine.
+
+    Textract sometimes cuts one ruled row into a row per printed line when its cells wrap
+    ("Laxido" / "Orange oral" / "powder" / ...). Such a line fills fewer columns than the
+    record, since one-line columns (quantity, medication type, ...) are already complete,
+    and either finishes a date left incomplete above ("13" / "Oct" / "2026") or sits right
+    under the line above without the gap that a ruling line and cell padding leave.
+    """
+    filled = {f for f, v in fields.items() if v}
+    before = {f for f in fields if record.get(f)}
+    if not filled or len(filled) >= len(before) or len(filled - before) > 1:
+        return False
+    if any(record.get(f) and fields.get(f) and not transform_date(record[f]) for f in ('start_date', 'end_date')):
+        return True
+    upper = [doc.reading_box(w) for w in _words(doc, upper_cells or [])]
+    lower = [doc.reading_box(w) for w in _words(doc, cells)]
+    heights = sorted(b.get('Height', 0) for b in upper + lower)
+    if not upper or not lower or not heights[len(heights) // 2]:
+        return False
+    gap = min(b.get('Top', 0) for b in lower) - max(b.get('Top', 0) + b.get('Height', 0) for b in upper)
+    return gap < WRAP_GAP * heights[len(heights) // 2]
+
+
+def _separator(doc, upper, lower):
+    """'' when the printer broke one word across the two lines ("Aripiprazol" / "e"), else ' '."""
+    if not upper or not lower or not upper.word_ids or not lower.word_ids:
+        return ' '
+    a, b = doc.index.get(upper.word_ids[-1]), doc.index.get(lower.word_ids[0])
+    if not a or not b:
+        return ' '
+    joined = doc._join_lines([(doc.bbox(a), a.get('Text', '')), (doc.bbox(b), b.get('Text', ''))], upper.bbox)
+    return ' ' if ' ' in joined else ''
 
 
 def header_for(grid, title, context):
@@ -95,6 +143,9 @@ def extract_tables(doc, cfg):
                 'header_score':round(score,3), 'row_count':0}
         table_meta.append(meta)
         first_row = True
+        # The last emitted record of this table, the cells of its latest line and, per
+        # field, the cell that last added text (to join a word broken across lines).
+        open_record, upper_cells, field_cells = None, None, {}
         for r in sorted({r for r,_ in grid}):
             if r <= header_row:
                 continue
@@ -102,14 +153,23 @@ def extract_tables(doc, cfg):
             headers = [c.text if c else '' for c in cells]
             if len(map_headers(headers, TABLES[kind])) >= max(2, len(mapping)//2) or is_header_fragment(cells):
                 continue  # repeated header, or the wrapped second line of the header
-            fields, provenance = {}, {}
+            fields, provenance, row_cells = {}, {}, {}
             for field in TABLES[kind]:
                 ix = mapping.get(field)
                 cell = cells[ix] if ix is not None and ix < len(cells) else None
                 # Cells holding only ruling lines or stray marks ("|", "-") count as empty.
                 fields[field] = cell.text.strip() if cell and norm(cell.text) else None
                 provenance[field] = doc.provenance(cell.block_ids, cell.word_ids, cell.page) if fields[field] else None
+                if fields[field]:
+                    row_cells[field] = cell
             if not any(v for v in fields.values()):
+                continue
+            if open_record is not None and is_wrapped_line(doc, upper_cells, cells, open_record, fields):
+                # One printed row that Textract cut into a row per line: put it back together.
+                merge_into(open_record, fields, provenance,
+                           {f: _separator(doc, field_cells.get(f), c) for f, c in row_cells.items()})
+                upper_cells = cells
+                field_cells.update(row_cells)
                 continue
             last = result[kind][-1] if result[kind] else None
             partial = not fields.get('drug_name') and not any(fields.get(f) for f in CRITICAL_FIELDS[kind])
@@ -128,6 +188,7 @@ def extract_tables(doc, cfg):
             record = {**fields, '_provenance': provenance, '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
             result[kind].append(record)
             meta['row_count'] += 1
+            open_record, upper_cells, field_cells = record, cells, row_cells
     # Review reasons are computed once all pages are read, so a record completed by a
     # continuation row is judged on its merged values.
     for kind, records in result.items():

@@ -216,10 +216,10 @@ def test_address_is_split_by_commas():
     assert split_address('HMP Ford', 'Ford Road, Ford, Arundel, W Sussex, BN18 OBX') == {
         'address_line_1': 'HMP Ford', 'address_line_2': 'Ford Road', 'address_line_3': 'Ford',
         'city': 'Arundel', 'county': 'W Sussex', 'postcode': 'BN18 OBX'}
-    # Fewer parts: the postcode, county and city are taken first, line 2 keeps the first part.
+    # Fewer parts: a town that is not a county is the city, line 2 keeps the first part.
     assert split_address('HMP X', 'Romsey Road, Winchester, SO22 5DF') == {
         'address_line_1': 'HMP X', 'address_line_2': 'Romsey Road', 'address_line_3': '',
-        'city': '', 'county': 'Winchester', 'postcode': 'SO22 5DF'}
+        'city': 'Winchester', 'county': '', 'postcode': 'SO22 5DF'}
 
 
 def test_site_name_and_address_stop_before_telephone():

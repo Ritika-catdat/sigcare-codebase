@@ -53,6 +53,24 @@ def transform_date(value):
     return ''
 
 
+# A day-month-year date inside other text: "19 Dec 1990", "19/12/1990", "1st Sept 1990", "1990-12-19".
+DATE_IN_TEXT = re.compile(
+    r'\b\d{1,2}(?:st|nd|rd|th)?[\s/.-]+(?:\d{1,2}|[A-Za-z]{3,9}\.?)[\s/.-]+\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b',
+    re.IGNORECASE)
+
+
+def date_only(value):
+    """'19 Dec 1990 (35 y)' -> '19 Dec 1990': only the day, month and year are kept, without the
+    age or any other text beside them. Text with no readable date is returned unchanged so a
+    reviewer can still see it."""
+    text = ' '.join(_str(value).split())
+    for match in DATE_IN_TEXT.finditer(text):
+        date = match.group().rstrip('.')
+        if transform_date(date):
+            return date
+    return text
+
+
 # UK postcode, allowing OCR reading 0 as O in the inward part ("BN18 OBX").
 POSTCODE = re.compile(r'\b[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9O][A-Z]{2}\b', re.IGNORECASE)
 # A phone/reference number after a separator: "/ 01293 566549", "\ Tel: +44 (0)1293 566549".
@@ -74,16 +92,65 @@ def clean_address(address):
     return text.strip(' ,/\|;:-')
 
 
+# A street or house-number part of an address is never the city.
+# Short forms count only at the end ("High St"), so "St Albans" stays a town.
+STREET = re.compile(
+    r'^\s*\d|\b(?:road|street|lane|avenue|drive|way|close|crescent|place|terrace|grove'
+    r'|court|square|row|walk|parade|gardens|mews|boulevard|hill)\b|\b(?:rd|st|ln|ave|dr)\.?\s*$', re.IGNORECASE)
+# UK counties (ceremonial, historic and the usual short forms), compared lower case.
+COUNTIES = {
+    'bedfordshire', 'berkshire', 'bristol', 'buckinghamshire', 'cambridgeshire', 'cheshire', 'cornwall',
+    'cumbria', 'cumberland', 'derbyshire', 'devon', 'dorset', 'durham', 'county durham', 'east riding of yorkshire',
+    'east sussex', 'essex', 'gloucestershire', 'greater london', 'greater manchester', 'hampshire',
+    'herefordshire', 'hertfordshire', 'isle of wight', 'kent', 'lancashire', 'leicestershire', 'lincolnshire',
+    'london', 'merseyside', 'middlesex', 'norfolk', 'north yorkshire', 'northamptonshire', 'northumberland',
+    'nottinghamshire', 'oxfordshire', 'rutland', 'shropshire', 'somerset', 'south yorkshire', 'staffordshire',
+    'suffolk', 'surrey', 'sussex', 'tyne and wear', 'warwickshire', 'west midlands', 'west sussex',
+    'west yorkshire', 'wiltshire', 'worcestershire', 'yorkshire', 'east yorkshire', 'avon', 'cleveland',
+    'humberside', 'westmorland',
+    'beds', 'berks', 'bucks', 'cambs', 'glos', 'gloucs', 'hants', 'herts', 'lancs', 'leics', 'lincs',
+    'northants', 'notts', 'oxon', 'salop', 'staffs', 'warks', 'wilts', 'worcs', 'yorks',
+    'anglesey', 'cardiff', 'carmarthenshire', 'ceredigion', 'clwyd', 'conwy', 'denbighshire', 'dyfed',
+    'flintshire', 'glamorgan', 'gwent', 'gwynedd', 'monmouthshire', 'pembrokeshire', 'powys', 'swansea',
+    'mid glamorgan', 'south glamorgan', 'west glamorgan',
+    'aberdeenshire', 'angus', 'argyll', 'ayrshire', 'dumfries and galloway', 'fife', 'highland',
+    'lanarkshire', 'lothian', 'midlothian', 'east lothian', 'west lothian', 'perth and kinross',
+    'renfrewshire', 'scottish borders', 'stirlingshire', 'dunbartonshire',
+    'antrim', 'armagh', 'down', 'fermanagh', 'londonderry', 'tyrone',
+}
+COMPASS = {'n': 'north', 's': 'south', 'e': 'east', 'w': 'west'}
+
+
+def is_county(part):
+    """'South Yorkshire', 'W Sussex', 'Co. Durham', 'Gloucestershire' -> True."""
+    words = re.sub(r'[^a-z ]+', ' ', _str(part).casefold()).split()
+    if words and words[0] in ('co', 'county') and len(words) > 1:
+        words = words[1:]
+    if words and words[0] in COMPASS:
+        words[0] = COMPASS[words[0]]
+    return ' '.join(words) in COUNTIES or ' '.join(words[1:]) in COUNTIES and words[0] in COMPASS.values()
+
+
 def split_address(site_name, address):
-    """Site name is line 1. In the address, after the last comma is the postcode, between the
-    last two commas the county, between the third- and second-last the city, up to the first
-    comma line 2, and whatever is left line 3."""
+    """Site name is line 1. In the address the postcode is the UK postcode at the end, the
+    county the part before it when it names a county (or, in a long address, the second-last
+    part), the city the part before that, line 2 the first part and line 3 whatever is left.
+    A street or house number is never taken as the city."""
     parts = [p.strip() for p in _str(address).split(',') if p.strip()]
     out = {'address_line_1': _str(site_name), 'address_line_2': '', 'address_line_3': '',
            'city': '', 'county': '', 'postcode': ''}
-    for field in ('postcode', 'county', 'city'):
-        if len(parts) >= 2:
-            out[field] = parts.pop()
+    found = list(POSTCODE.finditer(parts[-1])) if parts else []
+    if found:
+        # "Doncaster DN7 6EE" without a comma: the rest of the part stays in the address.
+        out['postcode'] = found[-1].group()
+        rest = parts.pop()[:found[-1].start()].strip(' ,')
+        if rest:
+            parts.append(rest)
+    if parts and (is_county(parts[-1]) or len(parts) >= 4):
+        out['county'] = parts.pop()
+    if len(parts) >= 2 or (len(parts) == 1 and (out['county'] or out['postcode'])
+                           and not STREET.search(parts[0])):
+        out['city'] = parts.pop()
     if parts:
         out['address_line_2'] = parts.pop(0)
     out['address_line_3'] = ', '.join(parts)
@@ -202,7 +269,9 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
         values[name] = value
         if value and conf is not None:
             confidence.append(conf)
-    prescription_date = _str((internal.get('prescription_date') or {}).get('value'))
+    # The cell can hold more than the date ("19 Dec 1990 (35 y)"); only the date is kept.
+    values['date_of_birth'] = date_only(values['date_of_birth'])
+    prescription_date = date_only((internal.get('prescription_date') or {}).get('value'))
     ip = [_record(r, IN_FIELDS) for r in internal.get('in_possession_medicines', [])]
     nip = [_record(r, NOT_FIELDS) for r in internal.get('not_in_possession_medicines', [])]
     allergy = [_record(r, ALLERGY_FIELDS) for r in internal.get('allergies', [])]

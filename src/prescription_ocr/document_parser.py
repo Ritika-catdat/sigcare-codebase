@@ -1,6 +1,7 @@
+import math
 import re
 from dataclasses import dataclass
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 @dataclass
 class Cell:
@@ -27,6 +28,47 @@ class Document:
     @staticmethod
     def bbox(block):
         return block.get('Geometry', {}).get('BoundingBox', {})
+
+    def page_rotation(self, page):
+        """Clockwise turn of the text on a page (0, 90, 180 or 270) as Textract saw it.
+
+        Textract starts each word's polygon at the text's own top-left corner, so on a page
+        scanned upside down the first point is at the bottom-right of the box. Coordinates
+        stay those of the scanned image, so on such a page the footer is at the "top".
+        """
+        cache = self.__dict__.setdefault('_rotation', {})
+        if page not in cache:
+            turns = []
+            for w in self.pages.get(page, []):
+                if w.get('BlockType') != 'WORD':
+                    continue
+                poly = w.get('Geometry', {}).get('Polygon') or []
+                if len(poly) >= 2:
+                    dx, dy = poly[1].get('X', 0) - poly[0].get('X', 0), poly[1].get('Y', 0) - poly[0].get('Y', 0)
+                    if dx or dy:
+                        turns.append(round(math.degrees(math.atan2(dy, dx)) / 90) % 4 * 90)
+            cache[page] = Counter(turns).most_common(1)[0][0] if turns else 0
+        return cache[page]
+
+    def reading_box(self, block):
+        """The block's box as it would be on the page turned the right way up."""
+        b = self.bbox(block)
+        left, top = b.get('Left', 0), b.get('Top', 0)
+        width, height = b.get('Width', 0), b.get('Height', 0)
+        rotation = self.page_rotation(block.get('Page', 1))
+        if rotation == 180:
+            return {'Left': 1 - left - width, 'Top': 1 - top - height, 'Width': width, 'Height': height}
+        if rotation == 90:
+            return {'Left': top, 'Top': 1 - left - width, 'Width': height, 'Height': width}
+        if rotation == 270:
+            return {'Left': 1 - top - height, 'Top': left, 'Width': height, 'Height': width}
+        return b
+
+    def table_word_ids(self):
+        """Ids of every word inside a table cell."""
+        if not hasattr(self, '_table_words'):
+            self._table_words = {w['Id'] for t in self.tables for w in self.child_words(t)}
+        return self._table_words
 
     @staticmethod
     def related(block, relationship):
