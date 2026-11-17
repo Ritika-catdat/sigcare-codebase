@@ -1,3 +1,5 @@
+import re
+
 from .output_contract import transform_date
 from .schemas import TABLES, CRITICAL_FIELDS, map_headers, classify, match_score, norm
 
@@ -69,6 +71,23 @@ def is_wrapped_line(doc, upper_cells, cells, record, fields):
         return False
     gap = min(b.get('Top', 0) for b in lower) - max(b.get('Top', 0) + b.get('Height', 0) for b in upper)
     return gap < WRAP_GAP * heights[len(heights) // 2]
+
+
+def handwritten_words(doc, cell):
+    """Handwritten words in a printed table cell, e.g. a "7" written beside a struck-out "28".
+
+    Pen strokes read as punctuation ("-", "~") are strike-through marks, not values.
+    """
+    if not cell:
+        return []
+    words = (doc.index.get(i) for i in cell.word_ids)
+    return [w.get('Text', '') for w in words
+            if w and w.get('TextType') == 'HANDWRITING' and re.search(r'[A-Za-z0-9]', w.get('Text', ''))]
+
+
+def merge_handwriting(record, handwriting):
+    for field, words in handwriting.items():
+        record.setdefault('_handwritten', {}).setdefault(field, []).extend(words)
 
 
 def _separator(doc, upper, lower):
@@ -153,7 +172,7 @@ def extract_tables(doc, cfg):
             headers = [c.text if c else '' for c in cells]
             if len(map_headers(headers, TABLES[kind])) >= max(2, len(mapping)//2) or is_header_fragment(cells):
                 continue  # repeated header, or the wrapped second line of the header
-            fields, provenance, row_cells = {}, {}, {}
+            fields, provenance, row_cells, handwriting = {}, {}, {}, {}
             for field in TABLES[kind]:
                 ix = mapping.get(field)
                 cell = cells[ix] if ix is not None and ix < len(cells) else None
@@ -162,12 +181,15 @@ def extract_tables(doc, cfg):
                 provenance[field] = doc.provenance(cell.block_ids, cell.word_ids, cell.page) if fields[field] else None
                 if fields[field]:
                     row_cells[field] = cell
+                    if handwritten_words(doc, cell):
+                        handwriting[field] = handwritten_words(doc, cell)
             if not any(v for v in fields.values()):
                 continue
             if open_record is not None and is_wrapped_line(doc, upper_cells, cells, open_record, fields):
                 # One printed row that Textract cut into a row per line: put it back together.
                 merge_into(open_record, fields, provenance,
                            {f: _separator(doc, field_cells.get(f), c) for f, c in row_cells.items()})
+                merge_handwriting(open_record, handwriting)
                 upper_cells = cells
                 field_cells.update(row_cells)
                 continue
@@ -179,13 +201,15 @@ def extract_tables(doc, cfg):
                 # Same table carried over a page break: complete the previous record instead
                 # of emitting a second, mostly blank one.
                 merge_into(last, fields, provenance)
+                merge_handwriting(last, handwriting)
                 continue
             if partial:
                 # No medicine/allergy and nothing to attach it to (e.g. an empty table whose
                 # rows continue on the next page): kept for audit, not emitted as a record.
                 meta.setdefault('skipped_rows', []).append(' | '.join(v for v in fields.values() if v))
                 continue
-            record = {**fields, '_provenance': provenance, '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
+            record = {**fields, '_provenance': provenance, '_handwritten': handwriting,
+                      '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
             result[kind].append(record)
             meta['row_count'] += 1
             open_record, upper_cells, field_cells = record, cells, row_cells
@@ -197,6 +221,12 @@ def extract_tables(doc, cfg):
             low_conf = [f for f, p in record['_provenance'].items()
                         if p and p.get('ocr_confidence') is not None and p['ocr_confidence'] < cfg.min_cell_confidence]
             record['_review_reasons'] = ([f'Missing critical fields: {", ".join(sorted(missing))}'] if missing else []) + ([f'Low OCR confidence: {", ".join(low_conf)}'] if low_conf else [])
+            # A value written by hand in a printed cell (often a correction over a struck-out
+            # printed value) is kept in the output, and a person checks which value applies.
+            hand = record.get('_handwritten') or {}
+            if hand:
+                record['_review_reasons'].append('Handwritten text in table: ' + ', '.join(
+                    f'{field} "{" ".join(words)}"' for field, words in hand.items()))
             if record['_review_reasons']:
                 source = record['_source']
                 review.append(f'{kind} page {source["page"]} row {source["row"]}: {"; ".join(record["_review_reasons"])}')

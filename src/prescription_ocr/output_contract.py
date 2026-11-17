@@ -175,13 +175,33 @@ def _patient_field(patient, name):
     return _str(field.get('value')), _provenance_confidence(field.get('provenance'))
 
 
+def _with_handwriting(value, words):
+    """Show a handwritten value apart from the printed text of its cell.
+
+    "28 day(s) 7" with a handwritten "7" becomes "28 day(s) [handwritten: 7]", so the
+    reviewer sees both the printed value and the hand correction. A cell written
+    entirely by hand keeps its text as it is.
+    """
+    if not words or not value:
+        return value
+    tokens = value.split()
+    for word in words:
+        for i in range(len(tokens) - 1, -1, -1):
+            if tokens[i] == word:
+                del tokens[i]
+                break
+    printed = ' '.join(tokens)
+    return f'{printed} [handwritten: {" ".join(words)}]' if printed else value
+
+
 def _record(row, fields):
     # Keep distinct prescriber_name and prescriber in the externally specified schema;
     # when only one printed header exists, do NOT hallucinate the other value.
     provenance = row.get('_provenance') or {}
+    handwritten = row.get('_handwritten') or {}
     out = {}
     for name in fields:
-        out[name] = _str(row.get(name))
+        out[name] = _with_handwriting(_str(row.get(name)), handwritten.get(name))
         if name == 'script_notes':
             # Script notes are checked on their own confidence, not only the record average.
             out['script_notes_ocr_confidence'] = (

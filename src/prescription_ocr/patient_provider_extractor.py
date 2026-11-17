@@ -134,16 +134,58 @@ def extract_patient(doc):
     return output
 
 
-def extract_prescription_date(doc):
-    """The date below the prescriber's signature (printed or handwritten).
+# Header cells of a signature table: "Authorising Signature | Print Name | ... | Date".
+SIGN_HEADER = re.compile(r'\b(?:signature|signed|sign|authoris\w*|authoriz\w*)\b')
+PRESCRIBER_HEADER = re.compile(r'\b(?:authoris\w*|authoriz\w*|prescriber|prescribed)\b')
+DATE_HEADER = re.compile(r'^date\b')
 
-    The prescriber signs straight after the medicine tables, so the first "Signed:"
-    label is theirs; the "Medication Received Signatures" lines further down have their
-    own (usually empty) dates and are not used. The nearest date under the first label
-    is taken, stopping at the next "Signed:" line so an allergy start date or the print
-    footer below is never picked up. Without a readable label, the first line starting
-    with "Date" is used instead.
+
+def _signature_table_dates(doc):
+    """Dates in the "Date" column of tables whose header row has a signature column.
+
+    Some forms put the prescriber's signature and its date in a table rather than under
+    a "Signed:" label. Returns (rank, page, top, date, provenance); rank 0 is a table
+    headed as the prescriber's ("Authorising Signature"), rank 1 any other signature table.
     """
+    found = []
+    for table in doc.tables:
+        grid = doc.table_grid(table)
+        rows = sorted({r for r, _ in grid})
+        for r in rows:
+            texts = {c: norm(cell.text) for (row, c), cell in grid.items() if row == r and cell.text}
+            if not any(SIGN_HEADER.search(t) for t in texts.values()):
+                continue
+            rank = 0 if any(PRESCRIBER_HEADER.search(t) for t in texts.values()) else 1
+            date_cols = [c for c, t in sorted(texts.items()) if DATE_HEADER.match(t)]
+            for c in date_cols:
+                # The date can share the header cell ("Date: 09 Oct 2026") or sit below it.
+                for row in [r] + [x for x in rows if x > r]:
+                    cell = grid.get((row, c))
+                    found_date = DATE_TEXT.search(cell.text) if cell and cell.text else None
+                    if found_date:
+                        box = doc.reading_box(table)
+                        found.append((rank, table.get('Page', 1), box.get('Top', 0), found_date.group(),
+                                      doc.provenance(cell.block_ids, cell.word_ids, cell.page)))
+                        break
+            if date_cols:
+                break
+    return sorted(found, key=lambda x: x[:3])
+
+
+def extract_prescription_date(doc):
+    """The date the prescriber signed (printed or handwritten).
+
+    A table headed as the prescriber's signature ("Authorising Signature | ... | Date")
+    gives its Date column. Otherwise the prescriber signs straight after the medicine
+    tables, so the first "Signed:" label is theirs; the "Medication Received Signatures"
+    lines further down have their own (usually empty) dates and are not used. The nearest
+    date under the first label is taken, stopping at the next "Signed:" line so an allergy
+    start date or the print footer below is never picked up. Then any other signature
+    table's Date column, and last the first line starting with "Date".
+    """
+    table_dates = _signature_table_dates(doc)
+    if table_dates and table_dates[0][0] == 0:
+        return _value(table_dates[0][3], table_dates[0][4])
     labels = signature_labels(doc)
     if labels:
         label = min(labels, key=lambda l: (l.get('Page', 1), doc.bbox(l).get('Top', 0)))
@@ -158,6 +200,8 @@ def extract_prescription_date(doc):
         found = DATE_TEXT.search(text)
         if found and not OTHER_DATE_LABELS.search(norm(text)):
             return _value(found.group(), doc.provenance([line['Id']]))
+    if table_dates:
+        return _value(table_dates[0][3], table_dates[0][4])
     return _value(None, None)
 
 

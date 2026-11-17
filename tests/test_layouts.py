@@ -212,3 +212,35 @@ def test_address_split_recognises_counties_and_streets():
         'city': '', 'county': 'Kent', 'postcode': 'ME1 1AA'}
     # Not an address at all: nothing is invented.
     assert split_address('', '13/10/2026 13:58, quantity, name')['postcode'] == ''
+
+
+def test_prescription_date_in_the_authorising_signature_table():
+    blocks = []
+    table(blocks, 'ip', [IP_HEADER, IP_HEADER_2,
+                         ['Duloxetine 30mg', '1 capsule', '1 daily', '16 Oct 2026', '7 day(s)', '7 capsule',
+                          'Regular', '7 capsules', '7 days', '', 'Muhammad Malik']], .2)
+    # The prescriber signs in a table: the date is in its "Date" column, not under a label.
+    table(blocks, 'sig', [['Authorising Signature', 'Print Name', 'Registration Number', 'Date'],
+                          ['', '', '', '09 Oct 2026']], .7, col_width=.2)
+    line(blocks, 'nhs', 'NHS Confidential: Personal Data about a Patient', .8)
+    out = output(blocks)
+    assert out['prescription_date'] == '09 Oct 2026'
+    assert out['prescription_date_transformed']
+
+
+def test_handwritten_correction_in_a_table_cell_is_kept_and_flagged():
+    blocks = []
+    table(blocks, 'ip', [IP_HEADER, IP_HEADER_2,
+                         ['Duloxetine 30mg', '1 capsule', '1 daily', '16 Oct 2026', '28 day(s) 7', '287 capsule',
+                          'Regular', '7 capsules', '7 days', '', 'Muhammad Malik']], .2)
+    # The prescriber struck out the printed 28 and wrote 7 beside it.
+    for ident in ('ipw3_5_2', 'ipw3_6_0'):
+        next(b for b in blocks if b['Id'] == ident)['TextType'] = 'HANDWRITING'
+    out = output(blocks)
+    record = out['in_possession'][0]
+    assert record['days_duration'] == '28 day(s) [handwritten: 7]'
+    assert record['quantity'] == 'capsule [handwritten: 287]'
+    assert record['possession_quantity'] == '7 capsules'
+    assert out['flag_for_review']
+    assert any('Handwritten text in table' in r and 'days_duration "7"' in r for r in out['review_reason'])
+    assert not out['hand_written_notes_present']
