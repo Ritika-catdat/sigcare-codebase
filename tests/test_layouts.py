@@ -239,8 +239,18 @@ def test_handwritten_correction_in_a_table_cell_is_kept_and_flagged():
     out = output(blocks)
     record = out['in_possession'][0]
     assert record['days_duration'] == '28 day(s) [handwritten: 7]'
-    assert record['quantity'] == 'capsule [handwritten: 287]'
+    assert record['quantity'] == '28 capsule [handwritten: 7]'
     assert record['possession_quantity'] == '7 capsules'
     assert out['flag_for_review']
     assert any('Handwritten text in table' in r and 'days_duration "7"' in r for r in out['review_reason'])
     assert not out['hand_written_notes_present']
+
+
+def test_handwritten_number_without_a_struck_printed_number_is_not_split():
+    blocks = []
+    table(blocks, 'ip', [IP_HEADER, IP_HEADER_2,
+                         ['Duloxetine 30mg', '1 capsule', '1 daily', '16 Oct 2026', '28 day(s)', '14 capsule',
+                          'Regular', '7 capsules', '7 days', '', 'Muhammad Malik']], .2)
+    next(b for b in blocks if b['Id'] == 'ipw3_6_0')['TextType'] = 'HANDWRITING'
+    record = output(blocks)['in_possession'][0]
+    assert record['quantity'] == 'capsule [handwritten: 14]'

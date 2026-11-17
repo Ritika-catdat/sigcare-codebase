@@ -85,6 +85,38 @@ def handwritten_words(doc, cell):
             if w and w.get('TextType') == 'HANDWRITING' and re.search(r'[A-Za-z0-9]', w.get('Text', ''))]
 
 
+def _row_numbers(doc, cells, handwritten):
+    words = (doc.index.get(i) for c in cells if c for i in c.word_ids)
+    return {n for w in words if w and (w.get('TextType') == 'HANDWRITING') == handwritten
+            for n in re.findall(r'\d+', w.get('Text', ''))}
+
+
+def split_struck_numbers(doc, cells, fields, handwriting):
+    """Split a struck-out printed number from the number written beside it.
+
+    OCR can read a printed "28" crossed out with a "7" written right after it as one
+    handwritten word "287". It is split when the front part is printed elsewhere in the
+    row ("28 day(s)") and the rest appears elsewhere in the row too (the "7" written in
+    the next column, or "7 capsules"), so "287 capsule" becomes "28 7 capsule" with only
+    the "7" handwritten.
+    """
+    printed = _row_numbers(doc, cells, False)
+    numbers = printed | _row_numbers(doc, cells, True)
+    for field, words in handwriting.items():
+        for i, word in enumerate(words):
+            if not word.isdigit() or len(word) < 2:
+                continue
+            # Elsewhere in the row: drop the merged word itself from the handwritten numbers.
+            others = numbers - {word}
+            splits = [(word[:k], word[k:]) for k in range(1, len(word))
+                      if word[:k] in printed and word[k:] in others]
+            if not splits:
+                continue
+            front, rest = max(splits, key=lambda s: len(s[0]))
+            words[i] = rest
+            fields[field] = re.sub(rf'(?<!\d){word}(?!\d)', f'{front} {rest}', fields[field], count=1)
+
+
 def merge_handwriting(record, handwriting):
     for field, words in handwriting.items():
         record.setdefault('_handwritten', {}).setdefault(field, []).extend(words)
@@ -185,6 +217,7 @@ def extract_tables(doc, cfg):
                         handwriting[field] = handwritten_words(doc, cell)
             if not any(v for v in fields.values()):
                 continue
+            split_struck_numbers(doc, cells, fields, handwriting)
             if open_record is not None and is_wrapped_line(doc, upper_cells, cells, open_record, fields):
                 # One printed row that Textract cut into a row per line: put it back together.
                 merge_into(open_record, fields, provenance,
