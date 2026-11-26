@@ -9,6 +9,7 @@ from pathlib import Path
 import fitz
 import numpy as np
 import pytesseract
+from PIL import Image
 
 from .integrity import page_image
 
@@ -41,6 +42,48 @@ CHARGING_SHEET_PATTERNS = {
     "site_date": r"\bsite\s+date\b",
     "urgents": r"\burgents\b",
 }
+
+# "HMP FOSSE WAY - HEADER SHEET": a handwritten list of what was sent to a houseblock.
+HEADER_SHEET_PATTERNS = {
+    "header_sheet": r"\bheader\s+sheet\b",
+    "received_on_main_map": r"\breceived\s+on\s+main\b",
+    "reconciled_on_houseblock": r"\breconciled\s+on\b",
+    "houseblock": r"\bhouse\s*block\b",
+    "tick_to_confirm_receipt": r"\btick\s+to\s+confirm\b",
+    "to_be_delivered_on": r"\bto\s+be\s+delivered\b",
+}
+
+# "RECORD OF PRESCRIPTIONS SENT TO SIGCARE PHARMACY" fax cover sheet.
+RECORD_SHEET_PATTERNS = {
+    "record_of_prescriptions": r"\brecord\s+of\s+prescriptions\b",
+    "cover_sheet_no": r"\bcover\s+sheet\b",
+    "date_faxed": r"\b(?:date|time)\s+faxed\b",
+    "required_date": r"\brequired\s+date\b",
+    "total_no_of_scripts": r"\btotal\s+no\.?\s+of\b",
+    "disclaimer": r"\bdisclaimer\b",
+}
+
+# A printed patient list: "Client ID | Patient | Drug | Possession Type".
+PATIENT_LIST_PATTERNS = {
+    "client_id": r"\bclient\s+id\b",
+    "possession_type": r"\bpossession\s+type\b",
+}
+
+# Words of an upright, readable page. A page scanned sideways or upside down gives
+# Tesseract almost none of these, so it is read again turned the other ways.
+# Only words of three letters or more: garbage from upside-down text is full of
+# short "words" such as "of" and "to".
+READABLE_WORDS = {
+    "the", "and", "for", "date", "name", "patient", "drug", "dose",
+    "page", "sheet", "tablets", "tablet", "possession", "prescriptions", "prescription",
+    "signed", "printed", "number", "total", "received", "notes", "quantity", "hmp", "sent",
+    "items", "birth", "prisoner", "confidential", "start", "days", "medication",
+}
+READABLE_MIN = 4
+
+
+def readable_score(text):
+    return sum(w in READABLE_WORDS for w in re.findall(r"[a-z]+", (text or "").lower()))
 
 
 # Tesseract processes run in parallel, one page each (pair with OMP_THREAD_LIMIT=1).
@@ -84,6 +127,29 @@ def ocr_image(image):
         config="--psm 11",
         timeout=OCR_TIMEOUT_SECONDS,
     ).strip()
+
+
+def ocr_any_orientation(image, ink=None):
+    """OCR text of the page turned the right way up.
+
+    Cover sheets are often scanned sideways, and Tesseract reads nothing useful from
+    sideways or upside-down text, so such a sheet was kept as a prescription. When the
+    upright read has too few ordinary words the page is read turned 90, 180 and 270
+    degrees, and the best read is kept. A page with almost no ink (the blank back of a
+    sheet) is not read again.
+    """
+    text = ocr_image(image)
+    best = (readable_score(text), text)
+    if best[0] >= READABLE_MIN or (ink is not None and ink < BLANK_INK_RATIO):
+        return text
+    for turn in (Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_270, Image.Transpose.ROTATE_180):
+        turned = ocr_image(image.transpose(turn))
+        score = readable_score(turned)
+        if score > best[0]:
+            best = (score, turned)
+        if score >= READABLE_MIN:
+            break
+    return best[1]
 
 
 def extract_page_text(page, dpi=250):
@@ -139,13 +205,20 @@ def classify_frontsheet(text):
                       if re.search(pattern, normalized)]
     matches.extend(charging_sheet)
 
+    # Houseblock header sheets, fax cover sheets and printed patient lists. A prescription
+    # has none of these labels, so two of them are enough.
+    other_sheets = [[name for name, pattern in patterns.items() if re.search(pattern, normalized)]
+                    for patterns in (HEADER_SHEET_PATTERNS, RECORD_SHEET_PATTERNS, PATIENT_LIST_PATTERNS)]
+    for found in other_sheets:
+        matches.extend(found)
+
     likely_frontsheet = (
         heading_found and supporting_count >= 1
     ) or (
         not heading_found and supporting_count >= 4
     ) or len(delivery_list) >= 3 or {"sent_on", "delivery_on"} <= set(delivery_list) or (
         "charging_sheet" in charging_sheet and len(charging_sheet) >= 2
-    ) or len(charging_sheet) >= 3
+    ) or len(charging_sheet) >= 3 or any(len(found) >= 2 for found in other_sheets)
 
     return {
         "likely_frontsheet": likely_frontsheet,
@@ -200,7 +273,7 @@ def detect_frontsheets(input_pdf, output_json, dpi=250):
             try:
                 image = page_image(page, dpi)
                 ink = ink_ratio(image)
-                future = pool.submit(ocr_image, image)
+                future = pool.submit(ocr_any_orientation, image, ink)
             except Exception as exc:
                 future = Future()
                 future.set_exception(exc)

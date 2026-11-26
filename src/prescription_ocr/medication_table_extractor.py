@@ -64,6 +64,13 @@ def is_wrapped_line(doc, upper_cells, cells, record, fields):
         return False
     if any(record.get(f) and fields.get(f) and not transform_date(record[f]) for f in ('start_date', 'end_date')):
         return True
+    # A row with its own complete date, or one filling most of the record's columns, is the
+    # next medicine: "Amlodipine 10mg tablets | 1 tablet | ... | 28 Oct 2026" right under
+    # "Orlistat ..." whose notes column made that row one field longer.
+    if any(fields.get(f) and transform_date(fields[f]) for f in ('start_date', 'end_date')):
+        return False
+    if 2 * len(filled) > len(before):
+        return False
     upper = [doc.reading_box(w) for w in _words(doc, upper_cells or [])]
     lower = [doc.reading_box(w) for w in _words(doc, cells)]
     heights = sorted(b.get('Height', 0) for b in upper + lower)
@@ -129,7 +136,8 @@ def _separator(doc, upper, lower):
     a, b = doc.index.get(upper.word_ids[-1]), doc.index.get(lower.word_ids[0])
     if not a or not b:
         return ' '
-    joined = doc._join_lines([(doc.bbox(a), a.get('Text', '')), (doc.bbox(b), b.get('Text', ''))], upper.bbox)
+    joined = doc._join_lines([(doc.reading_box(a), a.get('Text', '')), (doc.reading_box(b), b.get('Text', ''))],
+                             upper.bbox)
     return ' ' if ' ' in joined else ''
 
 
@@ -241,7 +249,7 @@ def extract_tables(doc, cfg):
                 # rows continue on the next page): kept for audit, not emitted as a record.
                 meta.setdefault('skipped_rows', []).append(' | '.join(v for v in fields.values() if v))
                 continue
-            record = {**fields, '_provenance': provenance, '_handwritten': handwriting,
+            record = {**fields, '_provenance': provenance, '_handwritten': handwriting, '_columns': set(mapping),
                       '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
             result[kind].append(record)
             meta['row_count'] += 1
@@ -250,7 +258,10 @@ def extract_tables(doc, cfg):
     # continuation row is judged on its merged values.
     for kind, records in result.items():
         for record in records:
-            missing = [f for f in CRITICAL_FIELDS[kind] if not record.get(f)]
+            # A layout without the column (no "Dose" on some forms; the script notes carry
+            # it) is not a missing value.
+            columns = record.pop('_columns', None)
+            missing = [f for f in CRITICAL_FIELDS[kind] if not record.get(f) and (columns is None or f in columns)]
             low_conf = [f for f, p in record['_provenance'].items()
                         if p and p.get('ocr_confidence') is not None and p['ocr_confidence'] < cfg.min_cell_confidence]
             record['_review_reasons'] = ([f'Missing critical fields: {", ".join(sorted(missing))}'] if missing else []) + ([f'Low OCR confidence: {", ".join(low_conf)}'] if low_conf else [])

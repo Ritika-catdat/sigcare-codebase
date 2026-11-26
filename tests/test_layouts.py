@@ -36,7 +36,7 @@ def line(blocks, ident, text, top, left=.05, page=1, rotation=0, word_ids=None):
                         Geometry=_geometry(left, top, width, .015, rotation)))
 
 
-def table(blocks, ident, rows, top, page=1, pitch=.022, col_width=.08, row_tops=None):
+def table(blocks, ident, rows, top, page=1, pitch=.022, col_width=.08, row_tops=None, rotation=0):
     """A TABLE whose cells hold real word boxes; each row is one printed line."""
     cells = []
     for r, texts in enumerate(rows, 1):
@@ -46,13 +46,13 @@ def table(blocks, ident, rows, top, page=1, pitch=.022, col_width=.08, row_tops=
             for i, word in enumerate(text.split()):
                 ids.append(f'{ident}w{r}_{c}_{i}')
                 blocks.append(block('WORD', ids[-1], Page=page, Text=word, TextType='PRINTED',
-                                    Geometry=_geometry(c * col_width + i * .018, row_top + .003, .015, .016, 0)))
+                                    Geometry=_geometry(c * col_width + i * .018, row_top + .003, .015, .016, rotation)))
             cells.append(f'{ident}c{r}_{c}')
             blocks.append(block('CELL', cells[-1], Page=page, RowIndex=r, ColumnIndex=c,
                                 Relationships=[{'Type': 'CHILD', 'Ids': ids}],
-                                Geometry=_geometry(c * col_width, row_top, col_width, pitch, 0)))
+                                Geometry=_geometry(c * col_width, row_top, col_width, pitch, rotation)))
     blocks.append(block('TABLE', ident, Page=page, Relationships=[{'Type': 'CHILD', 'Ids': cells}],
-                        Geometry=_geometry(col_width, top, col_width * 11, pitch * len(rows), 0)))
+                        Geometry=_geometry(col_width, top, col_width * 11, pitch * len(rows), rotation)))
     return [i for i in cells]
 
 

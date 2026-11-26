@@ -207,9 +207,14 @@ def extract_prescription_date(doc):
 
 # Words that name the establishment: "HMP Lindholme", "HMP/YOI Eastwood Park",
 # "Gatwick Immigration Removal Centre". "Prison Number" is a patient label, not a site.
+ESTABLISHMENT = (r'hmp|hmyoi|yoi|hm\s+prison|prison(?!\s*(?:number|no)\b)|young\s+offenders?\s+institution'
+                 r'|immigration\s+removal\s+centre|irc|secure\s+training\s+centre')
+# A prison or centre name outranks a department inside it: "HMP Huntercombe" over
+# "Healthcare Centre, Nuffield, ...". It is the site even when it ends in a street word
+# ("HMP Fosse Way").
+STRONG_SITE = re.compile(rf'\b(?:{ESTABLISHMENT})\b', re.IGNORECASE)
 SITE_WORDS = re.compile(
-    r'\b(?:hmp|hmyoi|yoi|hm\s+prison|prison(?!\s*(?:number|no)\b)|young\s+offenders?\s+institution'
-    r'|immigration\s+removal\s+centre|irc|secure\s+training\s+centre|hospital|healthcare|health\s+centre'
+    rf'\b(?:{ESTABLISHMENT}|hospital|healthcare|health\s+centre'
     r'|medical\s+centre|surgery|pharmacy|clinic)\b', re.IGNORECASE)
 # Print-run stamps and page footers are never the site or address: "Printed by Mrs X",
 # "08/10/2026 13:37 / Printed by Chloe Campbell (Page 1 of 1)", "Page 1 of 2",
@@ -236,7 +241,16 @@ def _provider_lines(doc):
     in_table = doc.table_word_ids()
     found = []
     for line in doc.lines():
-        text = line.get('Text', '').strip()
+        children = doc.child_words(line)
+        # A note written across the header ("Dossett box, scan both sides!") is not part
+        # of the address it runs over: only the printed words are kept.
+        printed = [w for w in children if w.get('TextType') != 'HANDWRITING']
+        if children and not printed:
+            continue
+        text = (' '.join(w.get('Text', '') for w in printed) if len(printed) < len(children)
+                else line.get('Text', '')).strip()
+        if text != line.get('Text', ''):
+            line = {**line, 'Text': text}
         words = norm(text).split()
         if not words or STAMP.search(text) or set(words) <= HEADER_WORDS:
             continue
@@ -244,7 +258,6 @@ def _provider_lines(doc):
             continue
         if any(match_score(text.split(':')[0], aliases) > .8 for aliases in PATIENT.values()):
             continue
-        children = doc.child_words(line)
         if children and 2 * sum(w['Id'] in in_table for w in children) > len(children):
             continue
         found.append(line)
@@ -280,25 +293,33 @@ def _steps(doc, lines, start, direction):
         yield line
 
 
-def _split_site(text):
+def _split_site(text, pattern=SITE_WORDS):
     """('HMP/YOI Eastwood Park', ['Wotton-under-Edge', 'Gloucestershire', 'GL12 8DB']) from
     'Wotton-under-Edge, Gloucestershire, GL12 8DB, HMP/YOI Eastwood Park'; (None, parts)
-    when no part names an establishment. A street ("Hospital Lane") is not a site."""
+    when no part names an establishment. A street ("Hospital Lane") is not a site, but a
+    prison named after one ("HMP Fosse Way") is."""
     parts = [p.strip() for p in text.split(',') if p.strip()]
     for i, part in enumerate(parts):
-        if SITE_WORDS.search(part) and not STREET.search(part):
+        if pattern.search(part) and (STRONG_SITE.search(part) or not STREET.search(part)):
             return parts.pop(i), parts
     return None, parts
 
 
-def _join(texts):
-    """A wrapped address keeps its own commas; separate lines become comma-separated parts."""
+def _join(texts, site=None):
+    """A wrapped address keeps its own commas; separate lines become comma-separated parts.
+    A part repeated (a header printing the site on its own line and again in the address
+    line) and the site name itself are kept once / left out."""
     address = ''
     for text in texts:
         text = text.strip().strip(',').strip() if not address else text.strip()
         if text:
             address = f'{address} {text}' if address.endswith(',') or not address else f'{address}, {text}'
-    return address.strip().rstrip(',')
+    parts, seen = [], {norm(site)} if site else set()
+    for part in (p.strip() for p in address.split(',')):
+        if part and norm(part) not in seen:
+            seen.add(norm(part))
+            parts.append(part)
+    return ', '.join(parts)
 
 
 def extract_provider(doc):
@@ -314,7 +335,16 @@ def extract_provider(doc):
     """
     lines = _provider_lines(doc)
     header = [l for l in lines if doc.reading_box(l).get('Top', 1) < HEADER_TOP]
+    # A prison/centre name first; a department or surgery name only when there is none.
+    site, site_ids, texts, address_ids = _find_provider(doc, lines, header, STRONG_SITE)
+    if site is None:
+        site, site_ids, texts, address_ids = _find_provider(doc, lines, header, SITE_WORDS)
+    address = _join(texts, site)
+    return {'name': _value(site, doc.provenance(site_ids) if site else None),
+            'address': _value(address, doc.provenance(address_ids) if address else None)}
 
+
+def _find_provider(doc, lines, header, site_words):
     def first(pattern):
         # The header area of the earliest page first, then anywhere outside the tables.
         return next((l for group in (header, lines) for l in group if pattern.search(l.get('Text', ''))), None)
@@ -322,14 +352,14 @@ def extract_provider(doc):
     site, site_ids, texts, address_ids = None, [], [], []
     anchor = first(POSTCODE)
     if anchor is not None:
-        site, parts = _split_site(anchor['Text'])
+        site, parts = _split_site(anchor['Text'], site_words)
         site_ids = [anchor['Id']] if site else []
         texts, address_ids = [', '.join(parts)], [anchor['Id']]
         for line in _steps(doc, lines, anchor, -1):
             text = line['Text'].strip()
             if CONTACT.match(norm(text)):
                 break
-            line_site, line_parts = _split_site(text)
+            line_site, line_parts = _split_site(text, site_words)
             if line_site or (site is None and not _looks_like_address(text)):
                 if site is None:
                     site, site_ids = line_site or text, [line['Id']]
@@ -343,15 +373,15 @@ def extract_provider(doc):
             address_ids.insert(0, line['Id'])
         if site is None:
             below = next(_steps(doc, lines, anchor, 1), None)
-            if below is not None and SITE_WORDS.search(below['Text']):
+            if below is not None and site_words.search(below['Text']):
                 site, site_ids = below['Text'].strip(), [below['Id']]
-    else:
-        start = first(SITE_WORDS)
+    elif site_words is SITE_WORDS or first(site_words) is not None:
+        start = first(site_words)
         if start is None:
             first_page = min(doc.pages, default=1)
             start = next((l for l in header if l.get('Page', 1) == first_page), None)
         if start is not None:
-            site, parts = _split_site(start['Text'])
+            site, parts = _split_site(start['Text'], site_words)
             if site is None:
                 site, parts = start['Text'].strip(), []
             site_ids = [start['Id']]
@@ -359,13 +389,11 @@ def extract_provider(doc):
                 texts, address_ids = [', '.join(parts)], [start['Id']]
             for line in _steps(doc, lines, start, 1):
                 text = line['Text'].strip()
-                if len(texts) >= 3 or CONTACT.match(norm(text)) or SITE_WORDS.search(text):
+                if len(texts) >= 3 or CONTACT.match(norm(text)) or STRONG_SITE.search(text):
                     break
                 texts.append(text)
                 address_ids.append(line['Id'])
-    address = _join(texts)
-    return {'name': _value(site, doc.provenance(site_ids) if site else None),
-            'address': _value(address, doc.provenance(address_ids) if address else None)}
+    return site, site_ids, texts, address_ids
 
 
 def _looks_like_address(text):

@@ -148,12 +148,14 @@ class Document:
             shadow = m and not anchor
             source = m if anchor else b
             words = [] if shadow else self.child_words(source)
-            text = '' if shadow else self._join_lines([(self.bbox(w), w.get('Text', '')) for w in words],
-                                                      self.bbox(source)) or self.text_of(source)
+            # Boxes as on the upright page, so line breaks and cell edges are found the same
+            # way on pages scanned sideways or upside down.
+            text = '' if shadow else self._join_lines([(self.reading_box(w), w.get('Text', '')) for w in words],
+                                                      self.reading_box(source)) or self.text_of(source)
             # Some MERGED_CELLs list child CELLS; text_of recursively handles those.
             grid[(row, col)] = Cell(text=text, page=b.get('Page', table.get('Page', 1)),
                                     block_ids=[source['Id']], confidence=source.get('Confidence'),
-                                    bbox=self.bbox(source), word_ids=[w['Id'] for w in words],
+                                    bbox=self.reading_box(source), word_ids=[w['Id'] for w in words],
                                     row=row, col=col,
                                     is_header='COLUMN_HEADER' in b.get('EntityTypes', []))
         self._split_overflowing_words(grid, {k for k in grid if k in merges})
@@ -173,9 +175,31 @@ class Document:
         pieces = {}
         for key, cell in grid.items():
             if key not in merged_positions:
-                pieces[key] = [(self.bbox(self.index[i]), self.index[i].get('Text', ''))
+                pieces[key] = [(self.reading_box(self.index[i]), self.index[i].get('Text', ''))
                                for i in cell.word_ids if i in self.index]
         changed = set()
+        # A word that starts in the previous column ("28 tabletDo" put in Medication notes
+        # where "28 tablet" belongs to Quantity): give the front of it back to that column.
+        for (row, col), cell in sorted(grid.items()):
+            prev = (row, col - 1)
+            if (row, col) not in pieces or prev not in pieces or not cell.bbox:
+                continue
+            edge = cell.bbox.get('Left', 0)
+            kept = []
+            for box, text in pieces[(row, col)]:
+                left, width = box.get('Left', 0), box.get('Width', 0)
+                over = edge - left
+                if width <= 0 or len(text) < 4 or left + width <= edge or over < max(.004, .2 * width):
+                    kept.append((box, text))
+                    continue
+                head, tail = self._cut(text, round(len(text) * over / width))
+                if head:
+                    self._insert_in_reading_order(pieces[prev], ({**box, 'Width': over}, head))
+                    changed.add(prev)
+                if tail:
+                    kept.append(({**box, 'Left': edge, 'Width': width - over}, tail))
+                changed.add((row, col))
+            pieces[(row, col)] = kept
         for (row, col), cell in sorted(grid.items()):
             nxt = (row, col + 1)
             if (row, col) not in pieces or nxt not in pieces or not cell.bbox:
@@ -202,6 +226,20 @@ class Document:
 
     # A line ending closer than this (in character widths) to the cell's right edge is full.
     WRAP_EDGE_CHARS = 2
+    # A line that ends with a strength ("50microgram", "2.5mg") ended at a word.
+    STRENGTH_END = re.compile(r'\d(?:mg|g|ml|mls|microgram|micrograms|mcg|unit|units|%)$', re.IGNORECASE)
+    # Words that start a new word, not finish one: "tablets" after "15mg", "Pharma" after
+    # "(Aspire". A capitalised word of three letters or more is never the tail of a word.
+    WORD_START = re.compile(
+        r'^(?:[A-Z][a-z]{2,}|(?:tablets?|capsules?|cream|gel|ointment|solution|suspension|inhaler|spray'
+        r'|drops|sachets?|patch(?:es)?|injection|lotion|shampoo|powder|liquid|syrup|modified|gastro'
+        r'|release|oral|sugar|chewable|dispersible|effervescent|soluble|film|coated|ltd)\b)')
+
+    def _word_break(self, prev, text):
+        """True when two pieces on consecutive lines are clearly separate words."""
+        if prev.endswith('-'):
+            return False  # "gastro-" / "resistant"
+        return bool(self.STRENGTH_END.search(prev) or self.WORD_START.match(text))
 
     def _join_lines(self, pieces, cell_box):
         """Join a cell's words, closing up a word the printer broke across two lines.
@@ -219,8 +257,15 @@ class Document:
                 char = prev_box.get('Width', 0) / max(len(prev), 1)
                 gap = edge - prev_box.get('Left', 0) - prev_box.get('Width', 0)
                 new_line = box.get('Top', 0) >= prev_box.get('Top', 0) + .6 * prev_box.get('Height', 0)
-                wrapped = (cell_box and new_line and -.5 * char <= gap < self.WRAP_EDGE_CHARS * char
-                           and re.search(r'[A-Za-z-]$', prev) and re.match(r'[A-Za-z]', text))
+                # A word ("Dapagliflozi" / "n") or a number ("202" / "6" in "15 Oct 2026").
+                continues = ((re.search(r'[A-Za-z-]$', prev) and re.match(r'[A-Za-z]', text))
+                             or (re.search(r'\d$', prev) and re.match(r'\d', text)))
+                wrapped = (cell_box and new_line and -.5 * char <= gap < self.WRAP_EDGE_CHARS * char and continues
+                           and not self._word_break(prev, text))
+                if wrapped and re.fullmatch(r'[A-Z]', text) and re.search(r'[a-z]$', prev):
+                    # The last letter of a lower-case word on its own line is often read as a
+                    # capital: "Propranolo" / "I", "capsule" / "S".
+                    text = 'l' if text == 'I' else text.lower()
                 out += '' if wrapped else ' '
             out += text
         return out.strip()

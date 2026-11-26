@@ -72,6 +72,7 @@ def date_only(value):
 
 
 # UK postcode, allowing OCR reading 0 as O in the inward part ("BN18 OBX").
+TRAILING_PRISONER_NUMBER = re.compile(r'[\s,;/-]+[A-Z]\d{4}[A-Z]{2}$')
 POSTCODE = re.compile(r'\b[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9O][A-Z]{2}\b', re.IGNORECASE)
 # A phone/reference number after a separator: "/ 01293 566549", "\ Tel: +44 (0)1293 566549".
 TRAILING_NUMBER = re.compile(
@@ -291,6 +292,8 @@ def build_output(internal, doc, handwriting, source, output_bucket, output_key):
             confidence.append(conf)
     # The cell can hold more than the date ("19 Dec 1990 (35 y)"); only the date is kept.
     values['date_of_birth'] = date_only(values['date_of_birth'])
+    # "Patient name: Mr Richard Osborne, A5595AL" prints the prisoner number after the name.
+    values['name'] = TRAILING_PRISONER_NUMBER.sub('', values['name']).strip()
     prescription_date = date_only((internal.get('prescription_date') or {}).get('value'))
     ip = [_record(r, IN_FIELDS) for r in internal.get('in_possession_medicines', [])]
     nip = [_record(r, NOT_FIELDS) for r in internal.get('not_in_possession_medicines', [])]

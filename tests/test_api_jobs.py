@@ -154,13 +154,13 @@ def test_frontsheet_ocr_timeout_marks_page_for_review(tmp_path, monkeypatch):
     _make_pdf(pdf, [("page one", None), ("page two", None), ("page three", None)])
     calls = iter(["text one", RuntimeError("Tesseract process timeout"), FRONT_SHEET_TEXT])
 
-    def fake_ocr(image):
+    def fake_ocr(image, ink=None):
         value = next(calls)
         if isinstance(value, Exception):
             raise value
         return value
 
-    monkeypatch.setattr(frontsheet, "ocr_image", fake_ocr)
+    monkeypatch.setattr(frontsheet, "ocr_any_orientation", fake_ocr)
     monkeypatch.setattr(frontsheet, "OCR_WORKERS", 1)  # deterministic call order
     results = frontsheet.detect_frontsheets(pdf, tmp_path / "report.json")
     assert [r["source_page"] for r in results] == [1, 2, 3]

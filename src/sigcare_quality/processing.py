@@ -112,14 +112,51 @@ def _get_marker(page: fitz.Page, ocr_text: str | None = None) -> tuple[int | Non
         ) from exc
 
 
+# Digits OCR often reads as letters: "A5595AL" as "ASS95AL".
+DIGIT_LOOKALIKES = str.maketrans("OoIlSsBZz", "001155822")
+PRISONER_NUMBER = re.compile(r"\b[A-Z][0-9OoIlSsBZz]{4}[A-Z]{2}\b")
+
+
+def _prisoner_numbers(text: str | None) -> set[str]:
+    """Prisoner numbers printed on a page ("A5595AL"), with look-alike letters in the
+    digit positions read as the digits. A word made only of letters is not a number."""
+    found = set()
+    for match in PRISONER_NUMBER.finditer(text or ""):
+        value = match.group()
+        digits = value[1:5]
+        if any(ch.isdigit() for ch in digits):
+            found.add(value[0] + digits.translate(DIGIT_LOOKALIKES) + value[5:])
+    return found
+
+
+def _same_patient(first: set[str], other: set[str]) -> bool:
+    """False only when both pages show prisoner numbers and none of them match.
+
+    Numbers differing in one or two characters count as the same (an OCR misread), so a
+    real two-page prescription is never cut in two.
+    """
+    if not first or not other:
+        return True
+    return any(sum(a != b for a, b in zip(x, y)) <= 2 for x in first for y in other)
+
+
 def _complete(group: list[int], markers: list[tuple[int | None, int | None]]) -> bool:
     """True when the group starts at 'Page 1 of N' and already has its N pages."""
     current, total = markers[group[0]]
     return current == 1 and total is not None and len(group) >= total
 
 
-def _group_pages(markers: list[tuple[int | None, int | None]]) -> list[list[int]]:
-    """Group pages by page-of-total counters; indices are zero-based."""
+def _group_pages(
+    markers: list[tuple[int | None, int | None]],
+    patients: list[set[str]] | None = None,
+) -> list[list[int]]:
+    """Group pages by page-of-total counters; indices are zero-based.
+
+    patients holds the prisoner numbers read on each page. A page showing another
+    patient's number never continues a prescription, whatever its counter was read as:
+    a misread "Page 1 of 1" must not join two patients' prescriptions.
+    """
+    patients = patients or [set() for _ in markers]
     groups: list[list[int]] = []
     i = 0
     count = len(markers)
@@ -138,6 +175,8 @@ def _group_pages(markers: list[tuple[int | None, int | None]]) -> list[list[int]
                     next_current != expected or next_total != total
                 ):
                     break
+                if not _same_patient(patients[i], patients[j]):
+                    break
                 # If the next page has no counter, keep it as a likely continuation.
                 group.append(j)
                 expected += 1
@@ -145,7 +184,8 @@ def _group_pages(markers: list[tuple[int | None, int | None]]) -> list[list[int]
             groups.append(group)
             i = j
         elif (current is not None and current > 1 and groups
-              and current == len(groups[-1]) + 1 and not _complete(groups[-1], markers)):
+              and current == len(groups[-1]) + 1 and not _complete(groups[-1], markers)
+              and _same_patient(patients[groups[-1][0]], patients[i])):
             # "Page 2 of 2" is never the first page of a prescription. It gets here when
             # the counter on the page before was misread ("10 of 10"), so it joins that
             # prescription - only as its next page, and never one already complete.
@@ -187,10 +227,12 @@ def split_pdf(
 
         original_pages = original_pages or list(range(1, source.page_count + 1))
         markers: list[tuple[int | None, int | None]] = []
+        patients: list[set[str]] = []
         for page_index, page in enumerate(source):
             ocr_text = ocr_text_by_page[page_index] if ocr_text_by_page else None
             marker = _get_marker(page, ocr_text)
             markers.append(marker)
+            patients.append(_prisoner_numbers(page.get_text("text") + "\n" + (ocr_text or "")))
             if marker[0] is None:
                 split_report.append(
                     f"Source page {original_pages[page_index]}: No marker detected"
@@ -200,7 +242,7 @@ def split_pdf(
                     f"Source page {original_pages[page_index]}: Page {marker[0]} of {marker[1]}"
                 )
 
-        groups = _group_pages(markers)
+        groups = _group_pages(markers, patients)
         for number, indices in enumerate(groups, start=1):
             target = fitz.open()
             try:
