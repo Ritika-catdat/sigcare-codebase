@@ -12,6 +12,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,7 +45,17 @@ def _find_page_marker(text: str) -> tuple[int | None, int | None]:
         current, total = int(match.group(1)), int(match.group(2))
         if 1 <= current <= total <= 200:
             return current, total
+    # OCR reads a small "1" as "l" or "i": "Page lofi" is "Page 1 of 1". Only trusted
+    # right after the word "page", where no ordinary word would be read as a counter.
+    for match in reversed(list(re.finditer(COUNTER_LOOKALIKE, text))):
+        current, total = (int(g.translate(COUNTER_DIGITS)) for g in match.groups())
+        if 1 <= current <= total <= 200:
+            return current, total
     return None, None
+
+
+COUNTER_LOOKALIKE = r"\bpage\s*([\dli!]{1,3})\s*(?:of|o[fl1i])\s*([\dli!]{1,3})\b"
+COUNTER_DIGITS = str.maketrans("li!", "111")
 
 
 def _footer_text(page: fitz.Page) -> str:
@@ -130,15 +141,48 @@ def _prisoner_numbers(text: str | None) -> set[str]:
     return found
 
 
-def _same_patient(first: set[str], other: set[str]) -> bool:
-    """False only when both pages show prisoner numbers and none of them match.
+PATIENT_NAME = re.compile(r"patient[ \t]*name[ \t]*[:;.]?[ \t]*([^\n]*)", re.IGNORECASE)
+NAME_END = re.compile(r"(?i)\b(?:date|dob|d\.o\.b|prisoner|nomis|nhs|born)\b|\d|[,|]")
+TITLES = {"mr", "mrs", "miss", "ms", "mx", "dr", "master"}
+# Two readings of one name score 0.8 and above even with OCR misreads; two patients' names
+# (Tanya Hoskin / Soraya Hatim) about 0.5.
+SAME_NAME_RATIO = 0.7
 
-    Numbers differing in one or two characters count as the same (an OCR misread), so a
-    real two-page prescription is never cut in two.
+
+def _patient_name(text: str | None) -> str | None:
+    """The patient name printed after "Patient name:", lower case without the title."""
+    for match in PATIENT_NAME.finditer(text or ""):
+        value = NAME_END.split(match.group(1))[0]
+        words = [w for w in re.findall(r"[a-z]+", value.lower()) if w not in TITLES]
+        if len(words) >= 2 and all(len(w) >= 2 for w in words[:2]):
+            return " ".join(words[:4])
+    return None
+
+
+def _patient(text: str | None) -> set[str]:
+    """What identifies the patient on a page: prisoner numbers and the name ("name:...")."""
+    name = _patient_name(text)
+    return _prisoner_numbers(text) | ({f"name:{name}"} if name else set())
+
+
+def _same_patient(first: set[str], other: set[str]) -> bool:
+    """False only when both pages show the patient's prisoner number, or both the name,
+    and they do not match.
+
+    Numbers differing in one or two characters, and names that read nearly the same, count
+    as the same (an OCR misread), so a real two-page prescription is never cut in two.
     """
-    if not first or not other:
-        return True
-    return any(sum(a != b for a, b in zip(x, y)) <= 2 for x in first for y in other)
+    numbers = [{v for v in side if not v.startswith("name:")} for side in (first, other)]
+    names = [{v[5:] for v in side if v.startswith("name:")} for side in (first, other)]
+    if all(numbers) and not any(
+        sum(a != b for a, b in zip(x, y)) <= 2 for x in numbers[0] for y in numbers[1]
+    ):
+        return False
+    if all(names) and not any(
+        SequenceMatcher(None, x, y).ratio() >= SAME_NAME_RATIO for x in names[0] for y in names[1]
+    ):
+        return False
+    return True
 
 
 def _complete(group: list[int], markers: list[tuple[int | None, int | None]]) -> bool:
@@ -153,9 +197,9 @@ def _group_pages(
 ) -> list[list[int]]:
     """Group pages by page-of-total counters; indices are zero-based.
 
-    patients holds the prisoner numbers read on each page. A page showing another
-    patient's number never continues a prescription, whatever its counter was read as:
-    a misread "Page 1 of 1" must not join two patients' prescriptions.
+    patients holds the prisoner numbers and patient name read on each page (_patient). A
+    page showing another patient's number or name never continues a prescription, whatever
+    its counter was read as: a misread "Page 1 of 1" must not join two patients' prescriptions.
     """
     patients = patients or [set() for _ in markers]
     groups: list[list[int]] = []
@@ -233,7 +277,7 @@ def split_pdf(
             ocr_text = ocr_text_by_page[page_index] if ocr_text_by_page else None
             marker = _get_marker(page, ocr_text)
             markers.append(marker)
-            patients.append(_prisoner_numbers(page.get_text("text") + "\n" + (ocr_text or "")))
+            patients.append(_patient(page.get_text("text") + "\n" + (ocr_text or "")))
             if marker[0] is None:
                 split_report.append(
                     f"Source page {original_pages[page_index]}: No marker detected"

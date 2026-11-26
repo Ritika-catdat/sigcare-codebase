@@ -1,6 +1,6 @@
 """Cover sheets seen in real batches, and splitting pages by patient."""
 from sigcare_quality.frontsheet import classify_frontsheet, readable_score
-from sigcare_quality.processing import _group_pages, _prisoner_numbers
+from sigcare_quality.processing import _find_page_marker, _group_pages, _patient, _prisoner_numbers
 
 
 def test_houseblock_header_sheet_is_a_front_sheet():
@@ -44,3 +44,34 @@ def test_page_of_another_patient_never_continues_a_prescription():
     # The same patient's next page (one character misread) still joins.
     assert _group_pages([(1, 2), (2, 2)], [{'A6390FD'}, {'A6390FO'}]) == [[0, 1]]
     assert _group_pages([(1, 2), (None, None)], [{'A6390FD'}, set()]) == [[0, 1]]
+
+
+def test_misread_page_counter_is_read():
+    assert _find_page_marker('Patient name: Mrs Jo Tate\nPage lofi') == (1, 1)
+    assert _find_page_marker('Page 1 ofl') == (1, 1)
+    assert _find_page_marker('Page 2 of 3') == (2, 3)
+    assert _find_page_marker('lots of files') == (None, None)
+
+
+def test_page_of_another_patient_by_name_never_continues_a_prescription():
+    # "Page 1 of 2", then a page whose counter OCR could not read and whose prisoner
+    # number was not read: only the patient name tells it is someone else.
+    first = _patient('Patient name: Mrs Jo Tate\nPrisoner number: A1234BC')
+    other = _patient('Patient name: Mrs Kay Morrow\nDrug name Dose')
+    assert _group_pages([(1, 2), (None, None)], [first, other]) == [[0], [1]]
+    # The same patient's page 2 with the name misread still joins.
+    same = _patient('Patient name: Mrs J0 Tate, A1234BC Date of birth: 01 Jan 1980')
+    assert _group_pages([(1, 2), (None, None)], [first, same]) == [[0, 1]]
+    assert _group_pages([(1, 2), (None, None)], [first, set()]) == [[0, 1]]
+
+
+def test_sideways_line_on_a_page_with_little_ink_is_read(monkeypatch):
+    from PIL import Image
+    from sigcare_quality import frontsheet
+    reads = iter(['', 'A0707CL Mr Jo Tate Doxepin solution for injection Not in possession'])
+    monkeypatch.setattr(frontsheet, 'ocr_image', lambda image: next(reads, ''))
+    text = frontsheet.ocr_any_orientation(Image.new('L', (40, 40), 255), ink=0.005)
+    assert 'Doxepin' in text and not frontsheet.is_blank(text, 0.005)
+    # No ink at all: the blank back of a sheet is not read again.
+    reads = iter(['', 'never read'])
+    assert frontsheet.ocr_any_orientation(Image.new('L', (40, 40), 255), ink=0.0) == ''

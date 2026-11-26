@@ -135,15 +135,20 @@ def ocr_any_orientation(image, ink=None):
     Cover sheets are often scanned sideways, and Tesseract reads nothing useful from
     sideways or upside-down text, so such a sheet was kept as a prescription. When the
     upright read has too few ordinary words the page is read turned 90, 180 and 270
-    degrees, and the best read is kept. A page with almost no ink (the blank back of a
-    sheet) is not read again.
+    degrees, and the best read is kept. A page with no ink at all (the blank back of a
+    sheet) is not read again. A page with a little ink is: one sideways printed line (a
+    prisoner number and a drug above a handwritten note) must not be taken for a blank page.
+    A turned read that times out ends the retries; the reads so far are kept.
     """
     text = ocr_image(image)
     best = (readable_score(text), text)
-    if best[0] >= READABLE_MIN or (ink is not None and ink < BLANK_INK_RATIO):
+    if best[0] >= READABLE_MIN or (ink is not None and ink < BLANK_NO_INK):
         return text
     for turn in (Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_270, Image.Transpose.ROTATE_180):
-        turned = ocr_image(image.transpose(turn))
+        try:
+            turned = ocr_image(image.transpose(turn))
+        except RuntimeError:
+            break
         score = readable_score(turned)
         if score > best[0]:
             best = (score, turned)
