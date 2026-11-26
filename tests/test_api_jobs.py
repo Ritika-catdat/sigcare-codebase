@@ -86,7 +86,7 @@ def test_process_job_removes_front_sheets_and_extracts(tmp_path, monkeypatch):
     monkeypatch.setattr(api, "OUTPUT_ROOT", tmp_path)
     calls = []
 
-    def fake_extract(pdf_path, prescription_number, job_id, original_pdf_location, prescription_location):
+    def fake_extract(pdf_path, prescription_number, job_id, original_pdf_location, prescription_location, **kwargs):
         calls.append(pdf_path.name)
         return {"flag_for_review": False, "review_reason": [], "file_name": pdf_path.name,
                 "prescription_number": str(prescription_number),

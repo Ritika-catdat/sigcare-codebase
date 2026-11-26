@@ -78,8 +78,12 @@ def extract_prescription_pdf(
     job_id: str,
     original_pdf_location: str = "",
     prescription_location: str = "",
+    textract_pdf: Path | None = None,
 ) -> dict[str, Any]:
     """Extract one prescription into the downstream JSON contract.
+
+    textract_pdf, when given, is the file uploaded to Textract (a black-and-white copy of
+    a tinted prescription); names and locations in the output stay those of pdf_path.
 
     Uses a temporary private S3 object that is deleted in a finally block.
     Block/word ids and bounding boxes stay internal; only the contract is returned.
@@ -101,7 +105,7 @@ def extract_prescription_pdf(
     try:
         # Upload only the individual split prescription, not the combined PDF.
         s3.upload_file(
-            str(pdf_path),
+            str(textract_pdf or pdf_path),
             bucket,
             key,
             ExtraArgs={

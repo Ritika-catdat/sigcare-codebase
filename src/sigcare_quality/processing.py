@@ -24,6 +24,7 @@ from .pipeline import run_quality_pipeline
 from .frontsheet import detect_frontsheets, ocr_image
 from .integrity import page_image
 from .observability import emit_metric, emit_metrics, submit_with_context
+from .monochrome import monochrome_copy
 from .textract_integration import extract_prescription_pdf, prescription_source
 from prescription_ocr.output_contract import failed_output
 
@@ -323,8 +324,12 @@ def extract_one(
     job_id: str,
     original_pdf_location: str = "",
     prescription_location: str = "",
+    textract_file: Path | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
-    """Run Textract for one prescription; never raises so other results survive."""
+    """Run Textract for one prescription; never raises so other results survive.
+
+    textract_file is the file sent to Textract when it differs from the split PDF
+    (a black-and-white copy of a tinted prescription)."""
     try:
         result = extract_prescription_pdf(
             pdf_path=split_file,
@@ -332,6 +337,7 @@ def extract_one(
             job_id=job_id,
             original_pdf_location=original_pdf_location,
             prescription_location=prescription_location,
+            textract_pdf=textract_file,
         )
         status = "REVIEW_REQUIRED" if result.get("flag_for_review") else "EXTRACTED"
         return result, status, None
@@ -453,6 +459,15 @@ def process_document(
     # (mostly waiting on AWS) run in background threads while quality and
     # cleanup use the CPU here.
     stage_start = time.monotonic()
+    # Prescriptions on coloured paper go to Textract as a black-and-white copy (made here,
+    # before the threads start: PyMuPDF is not thread-safe). Outputs keep the original name.
+    textract_files = []
+    for split_file in split_files:
+        try:
+            textract_files.append(monochrome_copy(split_file, split_dir.parent / "monochrome") or split_file)
+        except Exception:
+            LOG.exception("Black-and-white conversion failed for %s; using the original", split_file.name)
+            textract_files.append(split_file)
     extractions: dict[int, tuple[dict[str, Any], str, str | None]] = {}
     quality_reports: list[dict[str, Any]] = []
     with ThreadPoolExecutor(
@@ -463,7 +478,8 @@ def process_document(
             # Keep the job's log context (job_id, source_key) in the Textract threads.
             submit_with_context(pool, extract_one, split_file, number, job_id,
                                 original_pdf_location,
-                                artifact_location(relative(split_file))): number
+                                artifact_location(relative(split_file)),
+                                textract_files[number - 1]): number
             for number, split_file in enumerate(split_files, start=1)
         }
 
