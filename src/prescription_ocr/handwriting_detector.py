@@ -18,10 +18,11 @@ def signature_labels(doc):
 
 
 def below_signature(doc, block, labels):
-    """True when the block sits in the date area under one of the "Signed:" labels."""
-    b = doc.bbox(block)
+    """True when the block sits in the date area under one of the "Signed:" labels
+    (on the upright page, so an upside-down scan is read the same way)."""
+    b = doc.reading_box(block)
     for label in labels:
-        lb = doc.bbox(label)
+        lb = doc.reading_box(label)
         if (label.get('Page', 1) == block.get('Page', 1)
                 and lb.get('Top', 0) - .5 * lb.get('Height', 0) < b.get('Top', 0)
                 <= lb.get('Top', 0) + SIGNATURE_DATE_REACH):
@@ -75,10 +76,10 @@ def signature_word_ids(doc, hand):
     names = clinician_names(doc)
 
     def near_label(w):
-        b = doc.bbox(w)
+        b = doc.reading_box(w)
         y = b.get('Top', 0) + b.get('Height', 0) / 2
         for label in labels:
-            lb = doc.bbox(label)
+            lb = doc.reading_box(label)
             h = lb.get('Height', .01)
             right = lb.get('Left', 0) + lb.get('Width', 0)
             if (label.get('Page', 1) == w.get('Page', 1)

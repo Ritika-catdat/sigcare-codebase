@@ -24,6 +24,8 @@ class Document:
             self.pages[b.get('Page', 1)].append(b)
         self.tables = sorted([b for b in self.blocks if b.get('BlockType') == 'TABLE'],
                              key=lambda b: (b.get('Page', 1), self.bbox(b).get('Top', 0)))
+        self.tables = sorted(self.tables + self._layout_tables(),
+                             key=lambda b: (b.get('Page', 1), self.reading_box(b).get('Top', 0)))
 
     @staticmethod
     def bbox(block):
@@ -129,7 +131,132 @@ class Document:
                               'value_blocks': value_blocks, 'page': b.get('Page', 1)})
         return found
 
+    # ---- Tables Textract returned only as page layout ----
+
+    # A line this close (page width) to the left of a column header still starts in it.
+    LAYOUT_COLUMN_TOL = .006
+
+    @staticmethod
+    def _overlap(a, b):
+        """Share of b's area that a covers (raw page coordinates)."""
+        x = Document.bbox(a)
+        y = Document.bbox(b)
+        w = min(x.get('Left', 0) + x.get('Width', 0), y.get('Left', 0) + y.get('Width', 0)) - max(x.get('Left', 0), y.get('Left', 0))
+        h = min(x.get('Top', 0) + x.get('Height', 0), y.get('Top', 0) + y.get('Height', 0)) - max(x.get('Top', 0), y.get('Top', 0))
+        area = y.get('Width', 0) * y.get('Height', 0)
+        return max(w, 0) * max(h, 0) / area if area else 0
+
+    def _layout_tables(self):
+        """Tables Textract marked only as a LAYOUT_TABLE, with no TABLE block of cells.
+
+        On some scans (a darker tinted page, upside down) Textract finds the medicine table
+        as page layout but returns no cells for it, so nothing was extracted. Such a table
+        is rebuilt from the positions of its lines; it is used only when its first line
+        reads like a table header and no real TABLE covers the same area.
+        """
+        from .schemas import TABLES, norm
+        header_words = {w for schema in TABLES.values() for aliases in schema.values()
+                        for alias in aliases for w in norm(alias).split()}
+        found = []
+        for block in self.blocks:
+            if block.get('BlockType') != 'LAYOUT_TABLE':
+                continue
+            page = block.get('Page', 1)
+            if any(t.get('Page', 1) == page and self._overlap(t, block) > .5 for t in self.tables):
+                continue
+            lines = [self.index[i] for i in self.related(block, 'CHILD')
+                     if i in self.index and self.index[i].get('BlockType') == 'LINE']
+            grid = self._grid_from_lines(lines, header_words, norm)
+            if grid:
+                found.append({**block, 'BlockType': 'TABLE', '_grid': grid})
+        return found
+
+    def _grid_from_lines(self, lines, header_words, norm):
+        """Cells from line positions: columns start where the header lines start; a row
+        starts at a printed line that fills three or more columns and begins the first
+        column with a capital ("Dapagliflozi"), and the lines under it ("n 10mg",
+        "tablets") belong to the same row until the next one."""
+        if len(lines) < 4:
+            return None
+        boxes = {l['Id']: self.reading_box(l) for l in lines}
+        heights = sorted(b.get('Height', 0) for b in boxes.values())
+        tol = .6 * (heights[len(heights) // 2] or .01)
+        clusters = []
+        for line in sorted(lines, key=lambda l: boxes[l['Id']].get('Top', 0)):
+            top = boxes[line['Id']].get('Top', 0)
+            if clusters and top - clusters[-1][-1][0] < tol:
+                clusters[-1].append((top, line))
+            else:
+                clusters.append([(top, line)])
+        header = [l for _, l in clusters[0]]
+        if sum(bool(set(norm(l.get('Text', '')).split()) & header_words) for l in header) < 3:
+            return None
+        lefts = sorted(boxes[l['Id']].get('Left', 0) for l in header)
+
+        def column(line):
+            left = boxes[line['Id']].get('Left', 0) + self.LAYOUT_COLUMN_TOL
+            return max([i for i, x in enumerate(lefts) if x <= left], default=0)
+
+        rows = [[]]
+        for k, cluster in enumerate(clusters):
+            cl = [l for _, l in cluster]
+            starts = (k > 0 and len({column(l) for l in cl}) >= 3
+                      and any(column(l) == 0 and re.match(r'[A-Z]', l.get('Text', '')) for l in cl))
+            if starts:
+                rows.append([])
+            rows[-1].extend(cl)
+        if len(rows) < 2:
+            return None
+        right = max(b.get('Left', 0) + b.get('Width', 0) for b in boxes.values())
+        edges = [x - self.LAYOUT_COLUMN_TOL for x in lefts] + [right]
+        grid = {}
+        for r, row_lines in enumerate(rows, 1):
+            top = min(boxes[l['Id']].get('Top', 0) for l in row_lines)
+            bottom = max(boxes[l['Id']].get('Top', 0) + boxes[l['Id']].get('Height', 0) for l in row_lines)
+            by_col = defaultdict(list)
+            for line in row_lines:
+                by_col[column(line)].append(line)
+            for c, cell_lines in by_col.items():
+                cell_lines.sort(key=lambda l: (boxes[l['Id']].get('Top', 0), boxes[l['Id']].get('Left', 0)))
+                box = {'Left': edges[c], 'Top': top, 'Width': max(edges[c + 1] - edges[c], 0), 'Height': bottom - top}
+                words = [w for l in cell_lines for w in self.child_words(l)]
+                confs = [w['Confidence'] for w in words if 'Confidence' in w]
+                grid[(r, c + 1)] = Cell(
+                    text=self._join_lines([(boxes[l['Id']], l.get('Text', '')) for l in cell_lines], box),
+                    page=cell_lines[0].get('Page', 1), block_ids=[l['Id'] for l in cell_lines],
+                    confidence=sum(confs) / len(confs) if confs else None, bbox=box,
+                    word_ids=[w['Id'] for w in words], row=r, col=c + 1, is_header=r == 1)
+        return grid
+
+    def _reading_order(self, grid):
+        """Renumber rows and columns in reading order.
+
+        On some upside-down scans Textract numbers a table's rows and columns in scan
+        order, so a label ("Prisoner number:") has its value in the column to its left
+        and the rows run bottom-up. The grid is flipped so labels come before values.
+        """
+        def centre(cells, key, size):
+            vals = [c.bbox.get(key, 0) + c.bbox.get(size, 0) / 2 for c in cells if c.bbox]
+            return sum(vals) / len(vals) if vals else 0
+        rows = sorted({r for r, _ in grid})
+        cols = sorted({c for _, c in grid})
+        flip_rows = len(rows) > 1 and (centre([v for (r, _), v in grid.items() if r == rows[0]], 'Top', 'Height')
+                                       > centre([v for (r, _), v in grid.items() if r == rows[-1]], 'Top', 'Height'))
+        flip_cols = len(cols) > 1 and (centre([v for (_, c), v in grid.items() if c == cols[0]], 'Left', 'Width')
+                                       > centre([v for (_, c), v in grid.items() if c == cols[-1]], 'Left', 'Width'))
+        if not flip_rows and not flip_cols:
+            return grid
+        out = {}
+        for (r, c), cell in grid.items():
+            nr = rows[0] + rows[-1] - r if flip_rows else r
+            nc = cols[0] + cols[-1] - c if flip_cols else c
+            cell.row, cell.col = nr, nc
+            out[(nr, nc)] = cell
+        return out
+
     def table_grid(self, table):
+        if '_grid' in table:
+            return dict(table['_grid'])
         cells = [self.index[i] for i in self.related(table, 'CHILD')
                  if i in self.index and self.index[i].get('BlockType') == 'CELL']
         merged = [self.index[i] for i in self.related(table, 'MERGED_CELL') if i in self.index]
@@ -158,7 +285,12 @@ class Document:
                                     bbox=self.reading_box(source), word_ids=[w['Id'] for w in words],
                                     row=row, col=col,
                                     is_header='COLUMN_HEADER' in b.get('EntityTypes', []))
-        self._split_overflowing_words(grid, {k for k in grid if k in merges})
+        merged_positions = {k for k in grid if k in merges}
+        flipped = self._reading_order(grid)
+        if flipped is not grid:
+            merged_positions = {(c.row, c.col) for k, c in grid.items() if k in merged_positions}
+            grid = flipped
+        self._split_overflowing_words(grid, merged_positions)
         return grid
 
     # Characters a column ruling line is read as when OCR runs a word across it.
@@ -235,10 +367,25 @@ class Document:
         r'|drops|sachets?|patch(?:es)?|injection|lotion|shampoo|powder|liquid|syrup|modified|gastro'
         r'|release|oral|sugar|chewable|dispersible|effervescent|soluble|film|coated|ltd)\b)')
 
+    # Whole words a line often ends with. When the next line starts with a word of two
+    # letters or more, the line ended at this word ("times" / "per 1", "Ferrous" /
+    # "fumarate"); a single letter after it is still the end of a cut word ("table" / "t").
+    COMMON_WORDS = {
+        'times', 'per', 'day', 'days', 'tablet', 'tablets', 'capsule', 'capsules', 'sachet', 'sachets',
+        'ferrous', 'sodium', 'calcium', 'potassium', 'magnesium', 'oral', 'cream', 'gel', 'solution', 'the',
+        'and', 'of', 'at', 'to', 'for', 'with', 'after', 'before', 'food', 'take', 'apply', 'one', 'two',
+        'three', 'daily', 'morning', 'night', 'dose', 'each', 'every', 'week', 'weekly', 'hours', 'as',
+        'required', 'needed', 'when', 'sugar', 'free', 'modified', 'release', 'gastro', 'resistant',
+        'admin', 'pack', 'packs', 'in', 'possession', 'regular', 'dr', 'mr', 'mrs', 'ms', 'miss'}
+
     def _word_break(self, prev, text):
         """True when two pieces on consecutive lines are clearly separate words."""
         if prev.endswith('-'):
             return False  # "gastro-" / "resistant"
+        last = re.findall(r'[A-Za-z]+$', prev)
+        first = re.match(r'[A-Za-z]+', text)
+        if last and first and last[0].lower() in self.COMMON_WORDS and len(first.group()) >= 2:
+            return True
         return bool(self.STRENGTH_END.search(prev) or self.WORD_START.match(text))
 
     def _join_lines(self, pieces, cell_box):
@@ -262,6 +409,8 @@ class Document:
                              or (re.search(r'\d$', prev) and re.match(r'\d', text)))
                 wrapped = (cell_box and new_line and -.5 * char <= gap < self.WRAP_EDGE_CHARS * char and continues
                            and not self._word_break(prev, text))
+                # A closing bracket on its own line closes the line above: "(08:00" / ")".
+                wrapped = wrapped or bool(cell_box and new_line and re.fullmatch(r'[)\]]', text))
                 if wrapped and re.fullmatch(r'[A-Z]', text) and re.search(r'[a-z]$', prev):
                     # The last letter of a lower-case word on its own line is often read as a
                     # capital: "Propranolo" / "I", "capsule" / "S".
@@ -307,6 +456,7 @@ class Document:
         pieces.append(piece)
 
     def adjacent_lines(self, table, before=0.1):
-        tb = self.bbox(table)
-        top = tb.get('Top', 0)
-        return [l for l in self.lines(table.get('Page', 1)) if 0 <= top - self.bbox(l).get('Top', 0) <= before]
+        """Lines just above the table on the upright page (its title, "IN Possession ...")."""
+        top = self.reading_box(table).get('Top', 0)
+        return [l for l in self.lines(table.get('Page', 1))
+                if 0 <= top - self.reading_box(l).get('Top', 0) <= before]

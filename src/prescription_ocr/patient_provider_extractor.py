@@ -32,7 +32,7 @@ def _text_right_of_label(doc, aliases):
         label = line.get('Text', '').split(':')[0]
         if match_score(label, aliases) < .9:
             continue
-        lb = doc.bbox(line)
+        lb = doc.reading_box(line)
         top, height = lb.get('Top', 0), lb.get('Height', 0)
         right = lb.get('Left', 0) + lb.get('Width', 0)
         own = {w['Id'] for w in doc.child_words(line)}
@@ -40,12 +40,12 @@ def _text_right_of_label(doc, aliases):
         for w in doc.blocks:
             if w.get('BlockType') != 'WORD' or w['Id'] in own or w.get('Page', 1) != line.get('Page', 1):
                 continue
-            b = doc.bbox(w)
+            b = doc.reading_box(w)
             middle = b.get('Top', 0) + b.get('Height', 0) / 2
             if top - height * .3 <= middle <= top + height * 1.3 and right - .01 <= b.get('Left', 0) <= right + .4:
                 words.append(w)
         if words:
-            words.sort(key=lambda w: doc.bbox(w).get('Left', 0))
+            words.sort(key=lambda w: doc.reading_box(w).get('Left', 0))
             text = ' '.join(w.get('Text', '') for w in words).lstrip(':').strip()
             return text, doc.provenance([w['Id'] for w in words])
     return None, None
@@ -188,9 +188,9 @@ def extract_prescription_date(doc):
         return _value(table_dates[0][3], table_dates[0][4])
     labels = signature_labels(doc)
     if labels:
-        label = min(labels, key=lambda l: (l.get('Page', 1), doc.bbox(l).get('Top', 0)))
+        label = min(labels, key=lambda l: (l.get('Page', 1), doc.reading_box(l).get('Top', 0)))
         lines = sorted((l for l in doc.lines(label.get('Page', 1)) if below_signature(doc, l, [label])),
-                       key=lambda l: doc.bbox(l).get('Top', 0))
+                       key=lambda l: doc.reading_box(l).get('Top', 0))
     else:
         lines = [l for l in doc.lines() if norm(l.get('Text', '')).startswith('date')]
     for line in lines:

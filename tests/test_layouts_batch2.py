@@ -109,3 +109,74 @@ def test_handwriting_across_the_address_line_is_left_out():
     out = output(blocks)
     assert out['site_name'] == 'HMP Grendon'
     assert out['address'] == 'Grendon, Grendon Underwood, Aylesbury, Buckinghamshire, HP18 0TL'
+
+
+def _block(kind, ident, **extra):
+    from test_prescription_extraction import block
+    return block(kind, ident, **extra)
+
+
+def test_upside_down_patient_table_numbered_in_scan_order():
+    # Textract numbered this table's rows and columns in scan order: on the upright page
+    # the label column is column 2 and the rows run bottom-up.
+    blocks, cells = [], []
+    rows = [('Prisoner number:', 'A7701CN'), ('Date of birth:', '20 Sep 1983'), ('Patient name:', 'Mr Ali Khan')]
+    for upright_row, (label, value) in enumerate(rows):
+        for upright_col, text in enumerate((label, value)):
+            r, c = len(rows) - upright_row, 2 - upright_col
+            ids = []
+            for i, word in enumerate(text.split()):
+                ids.append(f'w{r}{c}{i}')
+                blocks.append(_block('WORD', ids[-1], Page=1, Text=word, TextType='PRINTED',
+                                     Geometry=_geometry(.1 + upright_col * .3 + i * .05, .2 + upright_row * .03,
+                                                        .04, .015, 180)))
+            cells.append(f'c{r}{c}')
+            blocks.append(_block('CELL', cells[-1], Page=1, RowIndex=r, ColumnIndex=c,
+                                 Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                                 Geometry=_geometry(.1 + upright_col * .3, .2 + upright_row * .03, .3, .03, 180)))
+    blocks.append(_block('TABLE', 't', Page=1, Relationships=[{'Type': 'CHILD', 'Ids': cells}],
+                         Geometry=_geometry(.1, .2, .6, .09, 180)))
+    out = output(blocks)
+    assert (out['patient_name'], out['date_of_birth'], out['prisoner_number']) == (
+        'Mr Ali Khan', '20 Sep 1983', 'A7701CN')
+
+
+def test_medicine_table_found_only_as_layout_is_rebuilt_from_its_lines():
+    blocks = []
+    line(blocks, 'title', 'IN Possession Prescriptions', .27)
+    ids = []
+    for ident, text, top, left in [('h1', 'Drug name', .3, .05), ('h2', 'Dose', .3, .2), ('h3', 'Script Notes', .3, .3),
+                                   ('h4', 'Start date', .3, .45), ('h5', 'Quantity', .3, .6),
+                                   ('h6', 'Prescriber', .3, .75),
+                                   ('a1', 'Amlodipine 5mg', .33, .05), ('a2', '1 tablet', .33, .2),
+                                   ('a3', 'daily', .33, .3), ('a4', '20 Oct 2026', .33, .45),
+                                   ('a5', '28 tablet', .33, .6), ('a6', 'Dr A', .33, .75),
+                                   ('a7', 'tablets', .345, .05),
+                                   ('b1', 'Paracetamol 500mg', .37, .05), ('b2', '2 tablets', .37, .2),
+                                   ('b3', 'when needed', .37, .3), ('b4', '20 Oct 2026', .37, .45),
+                                   ('b5', '32 tablet', .37, .6), ('b6', 'Dr A', .37, .75)]:
+        line(blocks, ident, text, top, left=left)
+        ids.append(ident)
+    # Textract marked the area as a table in the page layout but returned no cells.
+    blocks.append(_block('LAYOUT_TABLE', 'lt', Page=1, Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                         Geometry=_geometry(.04, .29, .9, .1, 0)))
+    out = output(blocks)
+    assert [(r['drug_name'], r['dose'], r['start_date'], r['quantity']) for r in out['in_possession']] == [
+        ('Amlodipine 5mg tablets', '1 tablet', '20 Oct 2026', '28 tablet'),
+        ('Paracetamol 500mg', '2 tablets', '20 Oct 2026', '32 tablet')]
+
+
+def test_prescription_date_under_the_signature_on_an_upside_down_page():
+    blocks = []
+    line(blocks, 'signed', 'Signed:', .85, rotation=180)
+    line(blocks, 'date', 'Date: 09 October 2026', .87, rotation=180)
+    assert output(blocks)['prescription_date'] == '09 October 2026'
+
+
+def test_whole_word_at_a_line_end_is_not_joined_to_the_next_word():
+    doc = Document({'Blocks': []})
+    cell = {'Left': 0, 'Top': 0, 'Width': .1, 'Height': .1}
+    pieces = [({'Left': .03, 'Top': 0, 'Width': .069, 'Height': .01}, 'Ferrous'),
+              ({'Left': .03, 'Top': .012, 'Width': .069, 'Height': .01}, 'fumarat'),
+              ({'Left': 0, 'Top': .024, 'Width': .01, 'Height': .01}, 'e')]
+    assert doc._join_lines(pieces, cell) == 'Ferrous fumarate'
