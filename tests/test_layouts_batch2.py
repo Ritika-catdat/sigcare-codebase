@@ -285,3 +285,26 @@ def test_not_in_possession_table_with_the_administration_column_keeps_it():
                           ['Methadone 1mg/ml oral solution', '', '20 Oct 2026', '16 Nov 2026', '28 day(s)',
                            '1680 ml', '', 'Dr Rachel Kavalier']], .2)
     assert any('dose' in reason for reason in output(blocks)['review_reason'])
+
+
+def test_last_letter_of_a_cut_dose_put_in_the_drug_name_cell_goes_back():
+    # Kirkham: Dose printed "1" / "table" / "t"; Textract put the "t" (just right of the
+    # column line, level with "tablets") in the Drug name cell: "Codeine 15mg tablets t".
+    blocks = []
+    table(blocks, 'ip', [IP_HEADER, IP_HEADER_2,
+                         ['Codeine 15mg tablets', '1 table', '1 tablet, 1 times per 1 day(s) (21:00)', '15 Oct 2026',
+                          '28 day(s)', '28 tablet', 'Regular', '28 tablets', '28 days', '', 'Dr A Shah']],
+          .2, pitch=.07)
+    # Drug name cell .08-.16: "Codeine" / "15mg" / "tablets" on three lines.
+    _place(blocks, 'ipw3_1_0', .081, .203, .05)
+    _place(blocks, 'ipw3_1_1', .081, .222, .03)
+    _place(blocks, 'ipw3_1_2', .081, .241, .04)
+    # Dose cell .16-.24: "1" / "table" filling the line / "t".
+    _place(blocks, 'ipw3_2_0', .161, .203, .006)
+    _place(blocks, 'ipw3_2_1', .161, .222, .077)
+    stray = next(b for b in blocks if b['Id'] == 'ipw3_2_1')
+    blocks.append({**stray, 'Id': 'stray_t', 'Text': 't', 'Geometry': _geometry(.1605, .241, .006, .016, 0)})
+    cell = next(b for b in blocks if b['Id'] == 'ipc3_1')
+    cell['Relationships'][0]['Ids'].append('stray_t')
+    record = output(blocks)['in_possession'][0]
+    assert (record['drug_name'], record['dose']) == ('Codeine 15mg tablets', '1 tablet')

@@ -367,6 +367,16 @@ class Document:
             for box, text in pieces[(row, col)]:
                 left, width = box.get('Left', 0), box.get('Width', 0)
                 over = left + width - edge
+                if 0 < width and over > width / 2:
+                    # Mostly in the next column: the last letter of a narrow Dose cell cut by
+                    # character ("1" / "table" / "t") that Textract put in Drug name
+                    # ("Codeine 15mg tablets t"). The whole word goes to the next column.
+                    self._insert_in_reading_order(pieces[nxt], (box, text))
+                    if word_of.get(id(box)) in cell.word_ids:
+                        cell.word_ids = [i for i in cell.word_ids if i != word_of[id(box)]]
+                        grid[nxt].word_ids = grid[nxt].word_ids + [word_of[id(box)]]
+                    changed.update({nxt, (row, col)})
+                    continue
                 if width <= 0 or len(text) < 4 or left >= edge or over < max(.004, .2 * width):
                     kept.append((box, text))
                     continue
