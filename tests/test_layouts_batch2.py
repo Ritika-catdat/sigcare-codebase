@@ -308,3 +308,36 @@ def test_last_letter_of_a_cut_dose_put_in_the_drug_name_cell_goes_back():
     cell['Relationships'][0]['Ids'].append('stray_t')
     record = output(blocks)['in_possession'][0]
     assert (record['drug_name'], record['dose']) == ('Codeine 15mg tablets', '1 tablet')
+
+
+def test_layout_table_line_running_across_a_column_line_is_split_between_columns():
+    # Kirkham page 31: no TABLE cells, and Textract read "tablets" (Drug name) and the last
+    # "t" of the Dose "1" / "table" / "t" as one line "tablets t".
+    blocks = []
+    line(blocks, 'title', 'IN Possession Prescriptions', .27)
+    ids = []
+    for ident, text, top, left in [('h1', 'Drug name', .3, .05), ('h2', 'Dose', .3, .2),
+                                   ('h3', 'Script Notes', .3, .3), ('h4', 'Start date', .3, .45),
+                                   ('h5', 'Quantity', .3, .6), ('h6', 'Prescriber', .3, .75),
+                                   ('a1', 'Codeine 15mg', .33, .05), ('a2', '1', .33, .2),
+                                   ('a3', 'daily', .33, .3), ('a4', '12 Oct 2026', .33, .45),
+                                   ('a5', '28 tablet', .33, .6), ('a6', 'Dr A', .33, .75)]:
+        line(blocks, ident, text, top, left=left)
+        ids.append(ident)
+    # "table" fills the Dose column (.2 to .3) up to its right edge.
+    blocks.append(_block('WORD', 'a8w0', Page=1, Text='table', TextType='PRINTED',
+                         Geometry=_geometry(.2, .345, .092, .015, 0)))
+    blocks.append(_block('LINE', 'a8', Page=1, Text='table', Relationships=[{'Type': 'CHILD', 'Ids': ['a8w0']}],
+                         Geometry=_geometry(.2, .345, .092, .015, 0)))
+    ids.append('a8')
+    blocks.append(_block('WORD', 'a7w0', Page=1, Text='tablets', TextType='PRINTED',
+                         Geometry=_geometry(.05, .36, .06, .015, 0)))
+    blocks.append(_block('WORD', 'a7w1', Page=1, Text='t', TextType='PRINTED',
+                         Geometry=_geometry(.199, .36, .006, .015, 0)))
+    blocks.append(_block('LINE', 'a7', Page=1, Text='tablets t', Relationships=[{'Type': 'CHILD', 'Ids': ['a7w0', 'a7w1']}],
+                         Geometry=_geometry(.05, .36, .155, .015, 0)))
+    ids.append('a7')
+    blocks.append(_block('LAYOUT_TABLE', 'lt', Page=1, Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                         Geometry=_geometry(.04, .29, .9, .1, 0)))
+    record = output(blocks)['in_possession'][0]
+    assert (record['drug_name'], record['dose']) == ('Codeine 15mg tablets', '1 tablet')

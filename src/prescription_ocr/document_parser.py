@@ -196,9 +196,39 @@ class Document:
             return None
         lefts = sorted(boxes[l['Id']].get('Left', 0) for l in header)
 
-        def column(line):
-            left = boxes[line['Id']].get('Left', 0) + self.LAYOUT_COLUMN_TOL
+        def column_at(box):
+            left = box.get('Left', 0) + self.LAYOUT_COLUMN_TOL
             return max([i for i, x in enumerate(lefts) if x <= left], default=0)
+
+        def column(line):
+            return column_at(boxes[line['Id']])
+
+        # Textract can read across a column line as one line ("tablets t": the end of
+        # Drug name and the last letter of a Dose cut by character). Each line is split
+        # into one piece per column its words fall in, so every word lands in its column.
+        pieces = []
+        for _, line in (item for cluster in clusters for item in cluster):
+            by_column = defaultdict(list)
+            for word in self.in_reading_order(self.child_words(line)):
+                by_column[column_at(self.reading_box(word))].append(word)
+            if len(by_column) < 2:
+                pieces.append((line, line))
+                continue
+            for c, words in sorted(by_column.items()):
+                word_boxes = [self.reading_box(w) for w in words]
+                left = min(b.get('Left', 0) for b in word_boxes)
+                top = min(b.get('Top', 0) for b in word_boxes)
+                piece = {'Id': f"{line['Id']}#{c}", 'Page': line.get('Page', 1), '_line': line['Id'],
+                         'Text': ' '.join(w.get('Text', '') for w in words), '_words': words}
+                boxes[piece['Id']] = {
+                    'Left': left, 'Top': top,
+                    'Width': max(b.get('Left', 0) + b.get('Width', 0) for b in word_boxes) - left,
+                    'Height': max(b.get('Top', 0) + b.get('Height', 0) for b in word_boxes) - top}
+                pieces.append((line, piece))
+        split = defaultdict(list)
+        for line, piece in pieces:
+            split[line['Id']].append(piece)
+        clusters = [[(top, piece) for top, line in cluster for piece in split[line['Id']]] for cluster in clusters]
 
         rows = [[]]
         for k, cluster in enumerate(clusters):
@@ -222,11 +252,12 @@ class Document:
             for c, cell_lines in by_col.items():
                 cell_lines.sort(key=lambda l: (boxes[l['Id']].get('Top', 0), boxes[l['Id']].get('Left', 0)))
                 box = {'Left': edges[c], 'Top': top, 'Width': max(edges[c + 1] - edges[c], 0), 'Height': bottom - top}
-                words = [w for l in cell_lines for w in self.child_words(l)]
+                words = [w for l in cell_lines for w in (l.get('_words') or self.child_words(l))]
                 confs = [w['Confidence'] for w in words if 'Confidence' in w]
                 grid[(r, c + 1)] = Cell(
                     text=self._join_lines([(boxes[l['Id']], l.get('Text', '')) for l in cell_lines], box),
-                    page=cell_lines[0].get('Page', 1), block_ids=[l['Id'] for l in cell_lines],
+                    page=cell_lines[0].get('Page', 1),
+                    block_ids=list(dict.fromkeys(l.get('_line', l['Id']) for l in cell_lines)),
                     confidence=sum(confs) / len(confs) if confs else None, bbox=box,
                     word_ids=[w['Id'] for w in words], row=r, col=c + 1, is_header=r == 1)
         return grid
