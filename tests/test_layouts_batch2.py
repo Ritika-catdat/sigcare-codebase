@@ -230,3 +230,58 @@ def test_two_medicines_textract_returned_as_one_row_are_split():
          '7 days')]
     assert rows[0]['script_notes'] == '1 tablet, 1 times per 1 day(s) (17:30)'
     assert rows[0]['medication_notes'] == 'take at night if possible' and not rows[1]['medication_notes']
+
+
+def test_cell_lines_listed_out_of_order_on_an_upside_down_page_are_read_in_order():
+    # Kirkham: Textract listed some cells' lines last line first ("10mg tablets" before
+    # "Dapagliflozin"), header cells included, so the columns were not recognised.
+    blocks = []
+    table(blocks, 'ip', [IP_HEADER, IP_HEADER_2,
+                         ['Dapagliflozin 10mg tablets', '1 tablet', 'daily', '15 Oct 2026', '28 day(s)',
+                          '28 tablets', 'Regular', '28 tablets', '28 days', '', 'Ms Stacy Collins']],
+          .2, pitch=.07, rotation=180)
+    _place(blocks, 'ipw3_1_0', .081, .343, .05, 180)
+    _place(blocks, 'ipw3_1_1', .081, .362, .02, 180)
+    _place(blocks, 'ipw3_1_2', .105, .362, .03, 180)
+    for b in blocks:
+        if b['BlockType'] == 'CELL':
+            b['Relationships'][0]['Ids'].reverse()
+    record = output(blocks)['in_possession'][0]
+    assert (record['drug_name'], record['dose'], record['start_date'], record['prescriber_name'] or record['prescriber']) == (
+        'Dapagliflozin 10mg tablets', '1 tablet', '15 Oct 2026', 'Ms Stacy Collins')
+
+
+def test_not_in_possession_table_with_a_dose_column_fills_dose():
+    blocks = []
+    line(blocks, 'title', 'NOT IN Possession Prescriptions', .17)
+    table(blocks, 'nip', [['Drug name', 'Dose', 'Start date', 'End date', 'Days duration', 'Quantity',
+                           'Medication notes', 'Prescriber name'],
+                          ['Methadone 1mg/ml oral solution', '60ml', '20 Oct 2026', '16 Nov 2026', '28 day(s)',
+                           '1680 ml', '', 'Dr Rachel Kavalier']], .2)
+    out = output(blocks)
+    record = out['not_in_possession'][0]
+    assert (record['drug_name'], record['dose'], record['administration_dose_time_description']) == (
+        'Methadone 1mg/ml oral solution', '60ml', '')
+    assert not out['in_possession']
+    assert not any('Missing critical' in reason for reason in out['review_reason'])
+
+
+def test_not_in_possession_table_with_the_administration_column_keeps_it():
+    blocks = []
+    line(blocks, 'title', 'NOT IN Possession Prescriptions', .17)
+    table(blocks, 'nip', [['Drug name', 'Administration dose / time description', 'Start date', 'End date',
+                           'Days duration', 'Quantity', 'Medication notes', 'Prescriber name'],
+                          ['Mirtazapine 15mg tablets', '1 tablet at night', '20 Oct 2026', '16 Nov 2026',
+                           '28 day(s)', '28 tablet', '', 'Dr Rachel Kavalier']], .2)
+    out = output(blocks)
+    record = out['not_in_possession'][0]
+    assert (record['dose'], record['administration_dose_time_description']) == ('', '1 tablet at night')
+    assert not any('Missing critical' in reason for reason in out['review_reason'])
+    # A not-in-possession row missing its dose is still flagged.
+    blocks = []
+    line(blocks, 'title', 'NOT IN Possession Prescriptions', .17)
+    table(blocks, 'nip', [['Drug name', 'Dose', 'Start date', 'End date', 'Days duration', 'Quantity',
+                           'Medication notes', 'Prescriber name'],
+                          ['Methadone 1mg/ml oral solution', '', '20 Oct 2026', '16 Nov 2026', '28 day(s)',
+                           '1680 ml', '', 'Dr Rachel Kavalier']], .2)
+    assert any('dose' in reason for reason in output(blocks)['review_reason'])

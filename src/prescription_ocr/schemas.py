@@ -26,6 +26,8 @@ TABLES = {
     },
     'not_in_possession_medicines': {
         'drug_name': ['drug name', 'medicine name', 'medication name', 'drug'],
+        # Most layouts have "Administration dose / time description"; some have "Dose" instead.
+        'dose': ['dose', 'dosage'],
         'administration_dose_time_description': ['administration dose time description', 'administration dose / time description', 'administration dose', 'administration time description', 'dose time description'],
         'start_date': ['start date'],
         'end_date': ['end date', 'stop date'],
@@ -43,7 +45,8 @@ TABLES = {
     }
 }
 CRITICAL_FIELDS = {'in_possession_medicines': {'drug_name', 'dose'},
-                   'not_in_possession_medicines': {'drug_name', 'administration_dose_time_description'},
+                   # Checked only for the columns the table has: "Dose" or the administration column.
+                   'not_in_possession_medicines': {'drug_name', 'dose', 'administration_dose_time_description'},
                    'allergies': {'allergy_or_sensitivity'}}
 
 def norm(s):
@@ -81,7 +84,7 @@ def classify(headers, title='', context=''):
     for kind, schema in TABLES.items():
         mapping = map_headers(headers, schema)
         # Optional columns cannot dilute the recognition score of older layouts.
-        required = set(schema) - ({'issuer', 'prescriber'} if kind == 'not_in_possession_medicines' else {'end_date'} if kind == 'allergies' else {'prescriber'} if kind == 'in_possession_medicines' else set())
+        required = set(schema) - ({'issuer', 'prescriber', 'dose'} if kind == 'not_in_possession_medicines' else {'end_date'} if kind == 'allergies' else {'prescriber'} if kind == 'in_possession_medicines' else set())
         score = len(required.intersection(mapping)) / max(len(required), 1)
         if kind == 'not_in_possession_medicines' and 'administration_dose_time_description' in mapping:
             score += .16

@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 IN_FIELDS = ('drug_name','dose','script_notes','start_date','days_duration','quantity','medication_type','possession_quantity','possession_interval','medication_notes','prescriber_name','prescriber')
-NOT_FIELDS = ('drug_name','administration_dose_time_description','start_date','end_date','days_duration','quantity','issuer','medication_notes','prescriber_name','prescriber')
+NOT_FIELDS = ('drug_name','dose','administration_dose_time_description','start_date','end_date','days_duration','quantity','issuer','medication_notes','prescriber_name','prescriber')
 ALLERGY_FIELDS = ('start_date','end_date','allergy_or_sensitivity')
 
 

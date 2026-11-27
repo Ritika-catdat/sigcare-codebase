@@ -98,7 +98,7 @@ class Document:
             return block.get('Text', '')
         if block.get('BlockType') == 'SELECTION_ELEMENT':
             return '[X]' if block.get('SelectionStatus') == 'SELECTED' else '[ ]'
-        words = self.child_words(block)
+        words = self.in_reading_order(self.child_words(block))
         return ' '.join(w.get('Text', '') for w in words).strip()
 
     def provenance(self, block_ids, word_ids=None, page=None):
@@ -277,7 +277,9 @@ class Document:
             anchor = m and row == m.get('RowIndex', row) and col == m.get('ColumnIndex', col)
             shadow = m and not anchor
             source = m if anchor else b
-            words = [] if shadow else self.child_words(source)
+            # Textract can list a cell's lines out of order on a rotated scan ("10mg tablets"
+            # before "Dapagliflozin"); words are taken in reading order on the upright page.
+            words = [] if shadow else self.in_reading_order(self.child_words(source))
             # Boxes as on the upright page, so line breaks and cell edges are found the same
             # way on pages scanned sideways or upside down.
             text = '' if shadow else self._join_lines([(self.reading_box(w), w.get('Text', '')) for w in words],
@@ -295,6 +297,13 @@ class Document:
             grid = flipped
         self._split_overflowing_words(grid, merged_positions)
         return grid
+
+    def in_reading_order(self, words):
+        """Words top to bottom, left to right as on the upright page."""
+        pieces = []
+        for word in words:
+            self._insert_in_reading_order(pieces, (self.reading_box(word), word))
+        return [word for _, word in pieces]
 
     # Characters a column ruling line is read as when OCR runs a word across it.
     BORDER_CHARS = '|!iIl1'
