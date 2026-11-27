@@ -180,3 +180,53 @@ def test_whole_word_at_a_line_end_is_not_joined_to_the_next_word():
               ({'Left': .03, 'Top': .012, 'Width': .069, 'Height': .01}, 'fumarat'),
               ({'Left': 0, 'Top': .024, 'Width': .01, 'Height': .01}, 'e')]
     assert doc._join_lines(pieces, cell) == 'Ferrous fumarate'
+
+
+def test_two_medicines_textract_returned_as_one_row_are_split():
+    # Eastwood Park: Textract missed the ruling line between Mirtazapine and Lansoprazole and
+    # returned one row holding both. Each cell's text runs over several printed lines.
+    header = ['Drug name', 'Dose', 'Script Notes', 'Start date', 'Days duration', 'Quantity',
+              'Medication type', 'Possession quantity', 'Possession interval', 'Medication notes',
+              'Prescriber name']
+    first = [['Mirtazapine', '30mg tablets'], ['1', 'tablet'], ['1 tablet,', 'times per', '1 day(s)', '(17:30)'],
+             ['28', 'Oct', '2026'], ['28', 'day(s)'], ['28 tablet'], ['Regular'], ['7 tablets'], ['7 days'],
+             ['take at night', 'if possible'], ['Dr Louise', 'Stranks']]
+    second = [['Lansoprazole', '30mg gastro-', 'resistant', 'capsules'], ['1', 'capsule'],
+              ['1 capsule,', '1 times', 'per 1', 'day(s)', '(08:00)'], ['28', 'Oct', '2026'], ['28', 'day(s)'],
+              ['28 capsule'], ['Regular'], ['7 capsules'], ['7 days'], [], ['Dr Louise', 'Stranks']]
+    blocks, cells, width, pitch = [], [], .085, .02
+
+    def cell(ident, r, c, lines, top, height, extra=()):
+        ids = []
+        for n, text in enumerate(lines):
+            for i, word in enumerate(text.split()):
+                ids.append(f'{ident}_{n}_{i}')
+                blocks.append(_block('WORD', ids[-1], Page=1, Text=word, TextType='PRINTED',
+                                     Geometry=_geometry(.02 + c * width + .002 + i * .03, top + n * pitch,
+                                                        .028, .014, 0)))
+        for ident_, word, left in extra:
+            ids.insert(1, ident_)
+            blocks.append(_block('WORD', ident_, Page=1, Text=word, TextType='PRINTED',
+                                 Geometry=_geometry(left, top, .006, .014, 0)))
+        cells.append(ident)
+        blocks.append(_block('CELL', ident, Page=1, RowIndex=r, ColumnIndex=c + 1,
+                             Relationships=[{'Type': 'CHILD', 'Ids': ids}],
+                             Geometry=_geometry(.02 + c * width, top - .003, width, height, 0)))
+
+    for c, text in enumerate(header):
+        cell(f'h{c}', 1, c, [text], .2, .03)
+    for c in range(len(header)):
+        # The last "1" of "1 tablet, 1" ran into the Start date column's left edge.
+        extra = [('stray1', '1', .02 + c * width - .005)] if c == 3 else ()
+        cell(f'd{c}', 2, c, first[c] + [''] * (4 - len(first[c])) + second[c], .235, .21, extra)
+    blocks.append(_block('TABLE', 't', Page=1, Relationships=[{'Type': 'CHILD', 'Ids': cells}],
+                         Geometry=_geometry(.02, .197, width * 11, .25, 0)))
+    line(blocks, 'title', 'IN Possession Prescriptions', .17)
+    rows = output(blocks)['in_possession']
+    assert [(r['drug_name'], r['dose'], r['start_date'], r['quantity'], r['medication_type'],
+             r['possession_interval']) for r in rows] == [
+        ('Mirtazapine 30mg tablets', '1 tablet', '28 Oct 2026', '28 tablet', 'Regular', '7 days'),
+        ('Lansoprazole 30mg gastro-resistant capsules', '1 capsule', '28 Oct 2026', '28 capsule', 'Regular',
+         '7 days')]
+    assert rows[0]['script_notes'] == '1 tablet, 1 times per 1 day(s) (17:30)'
+    assert rows[0]['medication_notes'] == 'take at night if possible' and not rows[1]['medication_notes']

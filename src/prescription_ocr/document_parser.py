@@ -14,6 +14,9 @@ class Cell:
     row: int
     col: int
     is_header: bool = False
+    # (box, text) per word in reading order, after overflowing words were given back to
+    # their column; None when the words are the cell's own word_ids unchanged.
+    pieces: list | None = None
 
 class Document:
     def __init__(self, response):
@@ -304,11 +307,15 @@ class Document:
         Notes. The word is cut where it crosses the edge (at the misread line character
         when there is one) and the overflow is inserted into the next cell in reading order.
         """
-        pieces = {}
+        pieces, word_of = {}, {}
         for key, cell in grid.items():
             if key not in merged_positions:
-                pieces[key] = [(self.reading_box(self.index[i]), self.index[i].get('Text', ''))
-                               for i in cell.word_ids if i in self.index]
+                pieces[key] = []
+                for i in cell.word_ids:
+                    if i in self.index:
+                        box = self.reading_box(self.index[i])
+                        word_of[id(box)] = i
+                        pieces[key].append((box, self.index[i].get('Text', '')))
         changed = set()
         # A word that starts in the previous column ("28 tabletDo" put in Medication notes
         # where "28 tablet" belongs to Quantity): give the front of it back to that column.
@@ -321,7 +328,17 @@ class Document:
             for box, text in pieces[(row, col)]:
                 left, width = box.get('Left', 0), box.get('Width', 0)
                 over = edge - left
-                if width <= 0 or len(text) < 4 or left + width <= edge or over < max(.004, .2 * width):
+                if 0 < width and over > max(.004, width / 2):
+                    # Mostly in the previous column ("1 tablet, 1" with its last "1" read
+                    # into Start date as "1 28 Oct 2026"): the whole word goes back.
+                    self._insert_in_reading_order(pieces[prev], (box, text))
+                    if word_of.get(id(box)) in cell.word_ids:
+                        cell.word_ids = [i for i in cell.word_ids if i != word_of[id(box)]]
+                        grid[prev].word_ids = grid[prev].word_ids + [word_of[id(box)]]
+                    changed.update({prev, (row, col)})
+                    continue
+                short = len(text) < (2 if text.isdigit() else 4)
+                if width <= 0 or short or left + width <= edge or over < max(.004, .2 * width):
                     kept.append((box, text))
                     continue
                 head, tail = self._cut(text, round(len(text) * over / width))
@@ -355,6 +372,7 @@ class Document:
             pieces[(row, col)] = kept
         for key in changed:
             grid[key].text = self._join_lines(pieces[key], grid[key].bbox)
+            grid[key].pieces = pieces[key]
 
     # A line ending closer than this (in character widths) to the cell's right edge is full.
     WRAP_EDGE_CHARS = 2
@@ -409,6 +427,9 @@ class Document:
                              or (re.search(r'\d$', prev) and re.match(r'\d', text)))
                 wrapped = (cell_box and new_line and -.5 * char <= gap < self.WRAP_EDGE_CHARS * char and continues
                            and not self._word_break(prev, text))
+                # A hyphenated word broken after its hyphen: "gastro-" / "resistant".
+                wrapped = wrapped or bool(new_line and re.search(r'[A-Za-z]-$', prev)
+                                          and re.match(r'[a-z]', text))
                 # A closing bracket on its own line closes the line above: "(08:00" / ")".
                 wrapped = wrapped or bool(cell_box and new_line and re.fullmatch(r'[)\]]', text))
                 if wrapped and re.fullmatch(r'[A-Z]', text) and re.search(r'[a-z]$', prev):

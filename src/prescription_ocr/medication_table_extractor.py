@@ -1,4 +1,6 @@
 import re
+from collections import Counter
+from dataclasses import replace
 
 from .output_contract import transform_date
 from .schemas import TABLES, CRITICAL_FIELDS, map_headers, classify, match_score, norm
@@ -78,6 +80,107 @@ def is_wrapped_line(doc, upper_cells, cells, record, fields):
         return False
     gap = min(b.get('Top', 0) for b in lower) - max(b.get('Top', 0) + b.get('Height', 0) for b in upper)
     return gap < WRAP_GAP * heights[len(heights) // 2]
+
+
+# Columns that hold one short value per medicine, and the word that ends that value.
+# Two complete values in one cell mean Textract put two medicines in one row.
+VALUE_END = {
+    'start_date': re.compile(r'^\d{4}[.,]?$'),
+    'end_date': re.compile(r'^\d{4}[.,]?$'),
+    'days_duration': re.compile(r'(?i)^(?:days?|weeks?|months?)(?:\(s\))?[.,]?$'),
+    'possession_interval': re.compile(r'(?i)^(?:days?|weeks?|months?)(?:\(s\))?[.,]?$'),
+}
+# Words a value must contain besides its last word: a month in a date, a number in a duration.
+VALUE_BODY = {
+    'start_date': re.compile(r'(?i)^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)'),
+    'end_date': re.compile(r'(?i)^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)'),
+    'days_duration': re.compile(r'^\d+$'),
+    'possession_interval': re.compile(r'^\d+$'),
+}
+# Medication type values start with a capital ("Regular", "When required", "As required").
+TYPE_START = re.compile(r'^[A-Z][a-z]{2,}')
+
+
+def _reading_words(doc, cell):
+    """The cell's words as (box, word) in reading order on the upright page."""
+    pieces = []
+    for i in cell.word_ids if cell else []:
+        if i in doc.index:
+            doc._insert_in_reading_order(pieces, (doc.reading_box(doc.index[i]), doc.index[i]))
+    return pieces
+
+
+def _value_starts(doc, cell, field):
+    """Boxes of the first word of the 2nd, 3rd ... value in a one-value-per-medicine cell,
+    or None when the cell holds a single value (or values that are not all complete)."""
+    pieces = _reading_words(doc, cell)
+    texts = [w.get('Text', '') for _, w in pieces]
+    if field == 'medication_type':
+        starts = [i for i, t in enumerate(texts) if i and TYPE_START.match(t)]
+        return [pieces[i][0] for i in starts] or None
+    end, body = VALUE_END[field], VALUE_BODY[field]
+    starts, begin = [], 0
+    for i, text in enumerate(texts):
+        if end.match(text) and i > begin:
+            if not any(body.match(t) for t in texts[begin:i]):
+                return None
+            if begin:
+                starts.append(pieces[begin][0])
+            begin = i + 1
+    if begin != len(texts):
+        return None  # words after the last complete value
+    return starts or None
+
+
+def split_merged_row(doc, cells, mapping):
+    """Cut a row holding two (or more) medicines into one row per medicine.
+
+    Textract sometimes misses the ruling line between two rows and returns both
+    medicines in one row ("Mirtazapine ... Lansoprazole ...", "Regular Regular"). When at
+    least two one-value columns (start date, duration, medication type, interval) each hold
+    the same number of complete values, and each next value starts at the same height in
+    all of them (cells of one row start level), every cell is cut at that height.
+    """
+    starts = {}
+    for field in [*VALUE_END, 'medication_type']:
+        ix = mapping.get(field)
+        cell = cells[ix] if ix is not None and ix < len(cells) else None
+        found = _value_starts(doc, cell, field) if cell else None
+        if found:
+            starts[field] = found
+    counts = Counter(len(v) for v in starts.values())
+    if not counts:
+        return [cells]
+    splits, agreeing = counts.most_common(1)[0]
+    if agreeing < 2:
+        return [cells]
+    columns = [v for v in starts.values() if len(v) == splits]
+    cuts = []
+    for k in range(splits):
+        boxes = [col[k] for col in columns]
+        tops = [b.get('Top', 0) for b in boxes]
+        height = sorted(b.get('Height', 0) for b in boxes)[len(boxes) // 2]
+        if not height or max(tops) - min(tops) > height:
+            return [cells]
+        cuts.append(min(tops) - .3 * height)
+    parts = [[] for _ in range(splits + 1)]
+    for cell in cells:
+        if cell is None:
+            for part in parts:
+                part.append(None)
+            continue
+        def part_of(box):
+            return sum(box.get('Top', 0) + box.get('Height', 0) / 2 >= cut for cut in cuts)
+        texts, ids = [[] for _ in parts], [[] for _ in parts]
+        # The text pieces keep words already given back to their own column.
+        for box, text in cell.pieces if cell.pieces is not None else [
+                (b, w.get('Text', '')) for b, w in _reading_words(doc, cell)]:
+            texts[part_of(box)].append((box, text))
+        for box, word in _reading_words(doc, cell):
+            ids[part_of(box)].append(word['Id'])
+        for part, text, word_ids in zip(parts, texts, ids):
+            part.append(replace(cell, word_ids=word_ids, pieces=text, text=doc._join_lines(text, cell.bbox)))
+    return parts
 
 
 def handwritten_words(doc, cell):
@@ -208,52 +311,54 @@ def extract_tables(doc, cfg):
         for r in sorted({r for r,_ in grid}):
             if r <= header_row:
                 continue
-            cells = cells_in_row(grid, r)
-            headers = [c.text if c else '' for c in cells]
-            if len(map_headers(headers, TABLES[kind])) >= max(2, len(mapping)//2) or is_header_fragment(cells):
+            row = cells_in_row(grid, r)
+            headers = [c.text if c else '' for c in row]
+            if len(map_headers(headers, TABLES[kind])) >= max(2, len(mapping)//2) or is_header_fragment(row):
                 continue  # repeated header, or the wrapped second line of the header
-            fields, provenance, row_cells, handwriting = {}, {}, {}, {}
-            for field in TABLES[kind]:
-                ix = mapping.get(field)
-                cell = cells[ix] if ix is not None and ix < len(cells) else None
-                # Cells holding only ruling lines or stray marks ("|", "-") count as empty.
-                fields[field] = cell.text.strip() if cell and norm(cell.text) else None
-                provenance[field] = doc.provenance(cell.block_ids, cell.word_ids, cell.page) if fields[field] else None
-                if fields[field]:
-                    row_cells[field] = cell
-                    if handwritten_words(doc, cell):
-                        handwriting[field] = handwritten_words(doc, cell)
-            if not any(v for v in fields.values()):
-                continue
-            split_struck_numbers(doc, cells, fields, handwriting)
-            if open_record is not None and is_wrapped_line(doc, upper_cells, cells, open_record, fields):
-                # One printed row that Textract cut into a row per line: put it back together.
-                merge_into(open_record, fields, provenance,
-                           {f: _separator(doc, field_cells.get(f), c) for f, c in row_cells.items()})
-                merge_handwriting(open_record, handwriting)
-                upper_cells = cells
-                field_cells.update(row_cells)
-                continue
-            last = result[kind][-1] if result[kind] else None
-            partial = not fields.get('drug_name') and not any(fields.get(f) for f in CRITICAL_FIELDS[kind])
-            continues = partial and first_row and last and last['_source']['page'] < table.get('Page', 1)
-            first_row = False
-            if continues:
-                # Same table carried over a page break: complete the previous record instead
-                # of emitting a second, mostly blank one.
-                merge_into(last, fields, provenance)
-                merge_handwriting(last, handwriting)
-                continue
-            if partial:
-                # No medicine/allergy and nothing to attach it to (e.g. an empty table whose
-                # rows continue on the next page): kept for audit, not emitted as a record.
-                meta.setdefault('skipped_rows', []).append(' | '.join(v for v in fields.values() if v))
-                continue
-            record = {**fields, '_provenance': provenance, '_handwritten': handwriting, '_columns': set(mapping),
-                      '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
-            result[kind].append(record)
-            meta['row_count'] += 1
-            open_record, upper_cells, field_cells = record, cells, row_cells
+            # Two medicines Textract returned as one row are read as two rows.
+            for cells in split_merged_row(doc, row, mapping):
+                fields, provenance, row_cells, handwriting = {}, {}, {}, {}
+                for field in TABLES[kind]:
+                    ix = mapping.get(field)
+                    cell = cells[ix] if ix is not None and ix < len(cells) else None
+                    # Cells holding only ruling lines or stray marks ("|", "-") count as empty.
+                    fields[field] = cell.text.strip() if cell and norm(cell.text) else None
+                    provenance[field] = doc.provenance(cell.block_ids, cell.word_ids, cell.page) if fields[field] else None
+                    if fields[field]:
+                        row_cells[field] = cell
+                        if handwritten_words(doc, cell):
+                            handwriting[field] = handwritten_words(doc, cell)
+                if not any(v for v in fields.values()):
+                    continue
+                split_struck_numbers(doc, cells, fields, handwriting)
+                if open_record is not None and is_wrapped_line(doc, upper_cells, cells, open_record, fields):
+                    # One printed row that Textract cut into a row per line: put it back together.
+                    merge_into(open_record, fields, provenance,
+                               {f: _separator(doc, field_cells.get(f), c) for f, c in row_cells.items()})
+                    merge_handwriting(open_record, handwriting)
+                    upper_cells = cells
+                    field_cells.update(row_cells)
+                    continue
+                last = result[kind][-1] if result[kind] else None
+                partial = not fields.get('drug_name') and not any(fields.get(f) for f in CRITICAL_FIELDS[kind])
+                continues = partial and first_row and last and last['_source']['page'] < table.get('Page', 1)
+                first_row = False
+                if continues:
+                    # Same table carried over a page break: complete the previous record instead
+                    # of emitting a second, mostly blank one.
+                    merge_into(last, fields, provenance)
+                    merge_handwriting(last, handwriting)
+                    continue
+                if partial:
+                    # No medicine/allergy and nothing to attach it to (e.g. an empty table whose
+                    # rows continue on the next page): kept for audit, not emitted as a record.
+                    meta.setdefault('skipped_rows', []).append(' | '.join(v for v in fields.values() if v))
+                    continue
+                record = {**fields, '_provenance': provenance, '_handwritten': handwriting, '_columns': set(mapping),
+                          '_source': {'page':table.get('Page',1), 'table_id':table['Id'], 'row':r}}
+                result[kind].append(record)
+                meta['row_count'] += 1
+                open_record, upper_cells, field_cells = record, cells, row_cells
     # Review reasons are computed once all pages are read, so a record completed by a
     # continuation row is judged on its merged values.
     for kind, records in result.items():
